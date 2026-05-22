@@ -1,0 +1,60 @@
+# Example wiring: a static site behind Traefik, gated by oidc-proxy.
+#
+# Routes:
+#   app.example.com/oauth2/*  -> oidc-proxy (no auth middleware)
+#   app.example.com/*         -> static site (auth middleware -> oidc-proxy /verify)
+
+services:
+  traefik:
+    image: traefik:v3
+    command:
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --entrypoints.web.address=:80
+      - --entrypoints.websecure.address=:443
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+
+  oidc-proxy:
+    image: oidc-proxy:latest
+    environment:
+      OIDC_ISSUER: https://accounts.google.com
+      OIDC_CLIENT_ID: your-client-id.apps.googleusercontent.com
+      # Optional: 32-byte key, base64 (any encoding). If unset, a key is
+      # generated at startup and sessions are invalidated on restart.
+      # Generate: openssl rand -base64 32
+      COOKIE_SECRET: ${COOKIE_SECRET:-}
+      # Optional access control:
+      # ALLOWED_DOMAINS: example.com,example.org
+      # ALLOWED_EMAILS: alice@example.com,bob@example.com
+      # Optional cosmetics:
+      # SIGN_IN_TITLE: "Acme intranet"
+      # SIGN_IN_BUTTON: "Sign in with Google"
+    labels:
+      - traefik.enable=true
+      # The auth-middleware Traefik uses to gate the static site.
+      - traefik.http.middlewares.oidc-auth.forwardauth.address=http://oidc-proxy:8080/verify
+      - traefik.http.middlewares.oidc-auth.forwardauth.authResponseHeaders=X-Auth-Request-Email,X-Auth-Request-User
+      # Public router for /oauth2/* (sign-in, start, callback, refresh, sign_out).
+      - traefik.http.routers.oidc-proxy.rule=Host(`app.example.com`) && PathPrefix(`/oauth2/`)
+      - traefik.http.routers.oidc-proxy.entrypoints=websecure
+      - traefik.http.routers.oidc-proxy.tls=true
+      - traefik.http.services.oidc-proxy.loadbalancer.server.port=8080
+
+  site:
+    image: nginx:alpine
+    volumes:
+      - ./public:/usr/share/nginx/html:ro
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.site.rule=Host(`app.example.com`)
+      - traefik.http.routers.site.entrypoints=websecure
+      - traefik.http.routers.site.tls=true
+      - traefik.http.routers.site.middlewares=oidc-auth@docker
+      - traefik.http.services.site.loadbalancer.server.port=80
+
+# At your OIDC provider, register a client (SPA / public, no secret) with
+# redirect URI: https://app.example.com/oauth2/callback
