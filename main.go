@@ -5,26 +5,28 @@ import (
 	"errors"
 	"log"
 	"net/http"
-	"os"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/coreos/go-oidc/v3/oidc"
+	"github.com/kelseyhightower/envconfig"
 	"golang.org/x/oauth2"
 )
 
 type Config struct {
-	Issuer         string
-	ClientID       string
-	Scopes         []string
-	AllowedEmails  map[string]bool
-	AllowedDomains map[string]bool
-	CookiePrefix   string
-	CookieDomain   string
-	CookieSecure   bool
-	ListenAddr     string
-	SignInTitle    string
-	SignInButton   string
+	Issuer          string   `envconfig:"OIDC_ISSUER" required:"true"`
+	ClientID        string   `envconfig:"OIDC_CLIENT_ID" required:"true"`
+	Scopes          string   `envconfig:"OIDC_SCOPES" default:"openid profile email"`
+	AllowedEmails   []string `envconfig:"ALLOWED_EMAILS"`
+	AllowedDomains  []string `envconfig:"ALLOWED_DOMAINS"`
+	CookiePrefix    string   `envconfig:"COOKIE_NAME_PREFIX" default:"_oidc_proxy"`
+	CookieDomain    string   `envconfig:"COOKIE_DOMAIN"`
+	CookieSecure    bool     `envconfig:"COOKIE_SECURE" default:"true"`
+	VerifyCacheSize int      `envconfig:"VERIFY_CACHE_SIZE" default:"1024"`
+	ListenAddr      string   `envconfig:"LISTEN_ADDR" default:":8080"`
+	SignInTitle     string   `envconfig:"SIGN_IN_TITLE" default:"Sign in"`
+	SignInButton    string   `envconfig:"SIGN_IN_BUTTON" default:"Sign in with SSO"`
 }
 
 // VerifiedToken carries the claims extracted from a verified ID token. The
@@ -34,6 +36,7 @@ type VerifiedToken struct {
 	Subject string
 	Email   string
 	Nonce   string
+	Expiry  time.Time
 }
 
 func wrapVerifier(v *oidc.IDTokenVerifier) func(context.Context, string) (*VerifiedToken, error) {
@@ -50,6 +53,7 @@ func wrapVerifier(v *oidc.IDTokenVerifier) func(context.Context, string) (*Verif
 			Subject: idTok.Subject,
 			Email:   claims.Email,
 			Nonce:   idTok.Nonce,
+			Expiry:  idTok.Expiry,
 		}, nil
 	}
 }
@@ -62,75 +66,22 @@ type Server struct {
 }
 
 func loadConfig() (Config, error) {
-	c := Config{
-		Issuer:       os.Getenv("OIDC_ISSUER"),
-		ClientID:     os.Getenv("OIDC_CLIENT_ID"),
-		CookiePrefix: getenv("COOKIE_NAME_PREFIX", "_oidc_proxy"),
-		CookieDomain: os.Getenv("COOKIE_DOMAIN"),
-		CookieSecure: getenvBool("COOKIE_SECURE", true),
-		ListenAddr:   getenv("LISTEN_ADDR", ":8080"),
-		SignInTitle:  getenv("SIGN_IN_TITLE", "Sign in"),
-		SignInButton: getenv("SIGN_IN_BUTTON", "Sign in with SSO"),
+	var c Config
+	if err := envconfig.Process("", &c); err != nil {
+		return c, err
 	}
-	if c.Issuer == "" {
-		return c, errors.New("OIDC_ISSUER is required")
+	// `openid` is mandatory per OIDC spec; auto-add if the user dropped it.
+	if !slices.Contains(strings.Fields(c.Scopes), "openid") {
+		c.Scopes = "openid " + strings.TrimSpace(c.Scopes)
 	}
-	if c.ClientID == "" {
-		return c, errors.New("OIDC_CLIENT_ID is required")
+	// Normalize allowlists for case-insensitive comparison.
+	for i, e := range c.AllowedEmails {
+		c.AllowedEmails[i] = strings.ToLower(strings.TrimSpace(e))
 	}
-
-	scopes := getenv("OIDC_SCOPES", "openid profile email")
-	c.Scopes = strings.Fields(scopes)
-	hasOpenid := false
-	for _, s := range c.Scopes {
-		if s == "openid" {
-			hasOpenid = true
-			break
-		}
+	for i, d := range c.AllowedDomains {
+		c.AllowedDomains[i] = strings.ToLower(strings.TrimSpace(d))
 	}
-	if !hasOpenid {
-		c.Scopes = append([]string{"openid"}, c.Scopes...)
-	}
-
-	c.AllowedEmails = parseSet(os.Getenv("ALLOWED_EMAILS"))
-	c.AllowedDomains = parseSet(os.Getenv("ALLOWED_DOMAINS"))
-
 	return c, nil
-}
-
-func getenv(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return fallback
-}
-
-func getenvBool(key string, fallback bool) bool {
-	v := os.Getenv(key)
-	if v == "" {
-		return fallback
-	}
-	switch strings.ToLower(v) {
-	case "1", "true", "yes", "on":
-		return true
-	case "0", "false", "no", "off":
-		return false
-	}
-	return fallback
-}
-
-func parseSet(s string) map[string]bool {
-	if s == "" {
-		return nil
-	}
-	out := map[string]bool{}
-	for _, p := range strings.Split(s, ",") {
-		p = strings.TrimSpace(strings.ToLower(p))
-		if p != "" {
-			out[p] = true
-		}
-	}
-	return out
 }
 
 func main() {
@@ -147,10 +98,11 @@ func main() {
 	}
 
 	verifier := provider.Verifier(&oidc.Config{ClientID: cfg.ClientID})
+	cache := newTokenCache(cfg.VerifyCacheSize)
 	s := &Server{
 		cfg:       cfg,
 		provider:  provider,
-		verifyFn:  wrapVerifier(verifier),
+		verifyFn:  withCache(wrapVerifier(verifier), cache),
 		endpoints: provider.Endpoint(),
 	}
 

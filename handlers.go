@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"time"
 )
@@ -75,7 +76,7 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 	}
 	s.renderHTML(w, startTemplate, flowData{
 		ClientID:          s.cfg.ClientID,
-		Scopes:            strings.Join(s.cfg.Scopes, " "),
+		Scopes:            s.cfg.Scopes,
 		AuthorizeEndpoint: s.endpoints.AuthURL,
 		TokenEndpoint:     s.endpoints.TokenURL,
 		CookiePrefix:      s.cfg.CookiePrefix,
@@ -90,7 +91,7 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 	s.renderHTML(w, callbackTemplate, flowData{
 		ClientID:          s.cfg.ClientID,
-		Scopes:            strings.Join(s.cfg.Scopes, " "),
+		Scopes:            s.cfg.Scopes,
 		AuthorizeEndpoint: s.endpoints.AuthURL,
 		TokenEndpoint:     s.endpoints.TokenURL,
 		CookiePrefix:      s.cfg.CookiePrefix,
@@ -108,7 +109,7 @@ func (s *Server) handleRefresh(w http.ResponseWriter, r *http.Request) {
 	}
 	s.renderHTML(w, refreshTemplate, flowData{
 		ClientID:          s.cfg.ClientID,
-		Scopes:            strings.Join(s.cfg.Scopes, " "),
+		Scopes:            s.cfg.Scopes,
 		AuthorizeEndpoint: s.endpoints.AuthURL,
 		TokenEndpoint:     s.endpoints.TokenURL,
 		CookiePrefix:      s.cfg.CookiePrefix,
@@ -237,11 +238,11 @@ func (s *Server) userAllowed(email string) bool {
 		return true
 	}
 	email = strings.ToLower(email)
-	if s.cfg.AllowedEmails[email] {
+	if slices.Contains(s.cfg.AllowedEmails, email) {
 		return true
 	}
 	if at := strings.LastIndexByte(email, '@'); at >= 0 {
-		if s.cfg.AllowedDomains[email[at+1:]] {
+		if slices.Contains(s.cfg.AllowedDomains, email[at+1:]) {
 			return true
 		}
 	}

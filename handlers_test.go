@@ -19,7 +19,7 @@ func newTestServer(t *testing.T) *Server {
 			CookiePrefix: "_oidc_proxy",
 			SignInTitle:  "Sign in",
 			SignInButton: "Sign in with SSO",
-			Scopes:       []string{"openid", "profile", "email"},
+			Scopes:       "openid profile email",
 		},
 		verifyFn: func(_ context.Context, tok string) (*VerifiedToken, error) {
 			if tok == "valid" {
@@ -28,6 +28,20 @@ func newTestServer(t *testing.T) *Server {
 			return nil, errors.New("invalid id_token")
 		},
 	}
+}
+
+func newAuthedRequest(s *Server, idToken string) *http.Request {
+	req := httptest.NewRequest(http.MethodGet, "http://oidc-proxy:8080/verify", nil)
+	req.Header.Set("X-Forwarded-Proto", "https")
+	req.Header.Set("X-Forwarded-Host", "app.example.com")
+	addTokenCookies(req, s, Tokens{IDToken: idToken})
+	return req
+}
+
+func recordVerify(s *Server, req *http.Request) *httptest.ResponseRecorder {
+	w := httptest.NewRecorder()
+	s.handleVerify(w, req)
+	return w
 }
 
 // addTokenCookies puts plain token cookies on req with the same names the
@@ -133,7 +147,7 @@ func TestVerifyRedirectsToSignInWhenNoRefreshToken(t *testing.T) {
 
 func TestVerifyDeniesDisallowedEmail(t *testing.T) {
 	s := newTestServer(t)
-	s.cfg.AllowedDomains = map[string]bool{"example.com": true}
+	s.cfg.AllowedDomains = []string{"example.com"}
 	s.verifyFn = func(_ context.Context, tok string) (*VerifiedToken, error) {
 		return &VerifiedToken{Subject: "x", Email: "mallory@evil.test"}, nil
 	}

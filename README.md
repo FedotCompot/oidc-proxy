@@ -126,10 +126,11 @@ the destination URL across the redirects.
 | --- | --- | --- | --- |
 | `OIDC_ISSUER` | yes | — | Discovery base URL (e.g. `https://accounts.google.com`) |
 | `OIDC_CLIENT_ID` | yes | — | Public client ID |
-| `OIDC_SCOPES` | no | `openid profile email` | Space-separated; `openid` is auto-added if missing |
+| `OIDC_SCOPES` | no | `openid profile email` | Space-separated string passed as-is to the provider; `openid` is auto-added if missing |
 | `COOKIE_NAME_PREFIX` | no | `_oidc_proxy` | Prefix for `_id_token` / `_access_token` / `_refresh_token` |
 | `COOKIE_DOMAIN` | no | request host | Set to share across subdomains |
 | `COOKIE_SECURE` | no | `true` | Set to `false` only for local HTTP testing |
+| `VERIFY_CACHE_SIZE` | no | `1024` | Max ID-token verification results to cache. Entries live until the JWT's own `exp` |
 | `ALLOWED_EMAILS` | no | — | Comma-separated allowlist of emails |
 | `ALLOWED_DOMAINS` | no | — | Comma-separated allowlist of email domains |
 | `SIGN_IN_TITLE` | no | `Sign in` | Sign-in page heading |
@@ -192,8 +193,12 @@ Standard SPA / public-client registration with PKCE. No special setup.
 - `POST /oauth2/session` enforces `Origin == X-Forwarded-Host`,
   blocking session-fixation attacks where a third-party site tries to
   install tokens into the user's browser.
-- On every protected request, the backend re-verifies the ID token via
-  JWKS (cached by `go-oidc`) — never trusts the cookie blindly.
+- On every protected request, the backend verifies the ID token via
+  JWKS (cached by `go-oidc`) — never trusts the cookie blindly. The
+  verification result is memoized in an in-process cache keyed by the
+  token's SHA-256, expiring at the JWT's own `exp`, so a busy session
+  pays the verification cost roughly once per token lifetime instead
+  of once per request.
 - Open-redirects are blocked: `rd` only accepts same-origin absolute paths.
 
 ## Build & run locally
