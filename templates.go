@@ -16,6 +16,7 @@ type flowData struct {
 	Scopes            string
 	AuthorizeEndpoint string
 	TokenEndpoint     string
+	CookiePrefix      string
 	Redirect          string // not used by callback (it reads sessionStorage)
 }
 
@@ -209,20 +210,30 @@ var callbackTemplate = template.Must(template.New("callback").Parse(flowPageHead
 
 var refreshTemplate = template.Must(template.New("refresh").Parse(flowPageHead + `<script>
 ` + pkceJS + `
+function readCookie(name) {
+  for (const part of document.cookie.split(';')) {
+    const eq = part.indexOf('=');
+    if (eq < 0) continue;
+    if (part.slice(0, eq).trim() === name) {
+      return decodeURIComponent(part.slice(eq + 1));
+    }
+  }
+  return '';
+}
 (async () => {
   const rd = {{.Redirect}};
+  const clientId = {{.ClientID}};
   const tokenEndpoint = {{.TokenEndpoint}};
+  const cookiePrefix = {{.CookiePrefix}};
   function bailToSignIn() {
     window.location = '/oauth2/sign_in?rd=' + encodeURIComponent(rd);
   }
   try {
-    const r = await fetch('/oauth2/refresh_token', { credentials: 'same-origin' });
-    if (!r.ok) return bailToSignIn();
-    const { refresh_token, client_id } = await r.json();
+    const refresh_token = readCookie(cookiePrefix + '_refresh_token');
     if (!refresh_token) return bailToSignIn();
     const tok = await tokenRequest(tokenEndpoint, {
       grant_type: 'refresh_token',
-      client_id,
+      client_id: clientId,
       refresh_token,
     });
     await postSession(tok);

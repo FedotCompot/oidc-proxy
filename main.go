@@ -2,11 +2,7 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
-	"crypto/sha256"
-	"encoding/base64"
 	"errors"
-	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -18,24 +14,50 @@ import (
 )
 
 type Config struct {
-	Issuer        string
-	ClientID      string
-	Scopes        []string
-	AllowedEmails map[string]bool
+	Issuer         string
+	ClientID       string
+	Scopes         []string
+	AllowedEmails  map[string]bool
 	AllowedDomains map[string]bool
-	CookiePrefix  string
-	CookieDomain  string
-	CookieSecure  bool
-	CookieKey     []byte
-	ListenAddr    string
-	SignInTitle   string
-	SignInButton  string
+	CookiePrefix   string
+	CookieDomain   string
+	CookieSecure   bool
+	ListenAddr     string
+	SignInTitle    string
+	SignInButton   string
+}
+
+// VerifiedToken carries the claims extracted from a verified ID token. The
+// struct is small on purpose: it isolates the handlers from go-oidc and lets
+// tests build a stub verifier without going through real JWT parsing.
+type VerifiedToken struct {
+	Subject string
+	Email   string
+	Nonce   string
+}
+
+func wrapVerifier(v *oidc.IDTokenVerifier) func(context.Context, string) (*VerifiedToken, error) {
+	return func(ctx context.Context, token string) (*VerifiedToken, error) {
+		idTok, err := v.Verify(ctx, token)
+		if err != nil {
+			return nil, err
+		}
+		var claims struct {
+			Email string `json:"email"`
+		}
+		_ = idTok.Claims(&claims)
+		return &VerifiedToken{
+			Subject: idTok.Subject,
+			Email:   claims.Email,
+			Nonce:   idTok.Nonce,
+		}, nil
+	}
 }
 
 type Server struct {
 	cfg       Config
 	provider  *oidc.Provider
-	verifyFn  func(ctx context.Context, token string) (*oidc.IDToken, error)
+	verifyFn  func(ctx context.Context, token string) (*VerifiedToken, error)
 	endpoints oauth2.Endpoint
 }
 
@@ -73,36 +95,7 @@ func loadConfig() (Config, error) {
 	c.AllowedEmails = parseSet(os.Getenv("ALLOWED_EMAILS"))
 	c.AllowedDomains = parseSet(os.Getenv("ALLOWED_DOMAINS"))
 
-	if secret := os.Getenv("COOKIE_SECRET"); secret != "" {
-		key, err := decodeKey(secret)
-		if err != nil {
-			return c, fmt.Errorf("COOKIE_SECRET: %w", err)
-		}
-		c.CookieKey = key
-	} else {
-		c.CookieKey = make([]byte, 32)
-		if _, err := rand.Read(c.CookieKey); err != nil {
-			return c, fmt.Errorf("generate cookie key: %w", err)
-		}
-		log.Printf("warning: COOKIE_SECRET not set; using ephemeral key (sessions invalidated on restart)")
-	}
-
 	return c, nil
-}
-
-func decodeKey(s string) ([]byte, error) {
-	for _, dec := range []func(string) ([]byte, error){
-		base64.StdEncoding.DecodeString,
-		base64.URLEncoding.DecodeString,
-		base64.RawStdEncoding.DecodeString,
-		base64.RawURLEncoding.DecodeString,
-	} {
-		if k, err := dec(s); err == nil && (len(k) == 16 || len(k) == 24 || len(k) == 32) {
-			return k, nil
-		}
-	}
-	h := sha256.Sum256([]byte(s))
-	return h[:], nil
 }
 
 func getenv(key, fallback string) string {
@@ -157,7 +150,7 @@ func main() {
 	s := &Server{
 		cfg:       cfg,
 		provider:  provider,
-		verifyFn:  verifier.Verify,
+		verifyFn:  wrapVerifier(verifier),
 		endpoints: provider.Endpoint(),
 	}
 
@@ -168,7 +161,6 @@ func main() {
 	mux.HandleFunc("/oauth2/callback", s.handleCallback)
 	mux.HandleFunc("/oauth2/refresh", s.handleRefresh)
 	mux.HandleFunc("/oauth2/session", s.handleSession)
-	mux.HandleFunc("/oauth2/refresh_token", s.handleRefreshToken)
 	mux.HandleFunc("/oauth2/sign_out", s.handleSignOut)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(204) })
 

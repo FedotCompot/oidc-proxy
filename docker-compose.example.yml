@@ -23,10 +23,6 @@ services:
     environment:
       OIDC_ISSUER: https://accounts.google.com
       OIDC_CLIENT_ID: your-client-id.apps.googleusercontent.com
-      # Optional: 32-byte key, base64 (any encoding). If unset, a key is
-      # generated at startup and sessions are invalidated on restart.
-      # Generate: openssl rand -base64 32
-      COOKIE_SECRET: ${COOKIE_SECRET:-}
       # Optional access control:
       # ALLOWED_DOMAINS: example.com,example.org
       # ALLOWED_EMAILS: alice@example.com,bob@example.com

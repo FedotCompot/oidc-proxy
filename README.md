@@ -8,15 +8,18 @@ middleware.
 It runs a true **SPA / public-client** flow: all OAuth token requests
 happen in the browser. The Go backend never exchanges codes or refresh
 tokens itself — it only **verifies** ID tokens (JWKS signature + claims)
-and seals them into an encrypted HttpOnly cookie. That keeps the design
-compatible with strict providers like Microsoft Entra ID, which refuses
-server-side token redemption when a redirect URI is registered as SPA.
+and writes the tokens as individual JS-readable cookies. That keeps the
+design compatible with strict providers like Microsoft Entra ID, which
+refuses server-side token redemption when a redirect URI is registered
+as SPA, and minimizes client–backend roundtrips: the refresh page reads
+its refresh token straight from `document.cookie`, and the static site
+can call APIs with the access token cookie without asking the backend.
 
 - Public-client / PKCE flow — no client secret needed
-- Browser does the token exchange; backend only verifies & seals cookies
-- AES-GCM encrypted HttpOnly session cookie holding ID + refresh tokens
-  (split across `<prefix>_session_0`, `<prefix>_session_1`, … to stay under
-  the 4KB per-cookie browser limit)
+- Browser does the token exchange; backend only verifies the ID token
+- Tokens are written as three separate plaintext cookies (`<prefix>_id_token`,
+  `<prefix>_access_token`, `<prefix>_refresh_token`). JS-readable; not
+  HttpOnly
 - Self-contained HTML sign-in screen + tiny JS pages (no external assets)
 - Zero config files — everything is env vars
 - Two required env vars: `OIDC_ISSUER`, `OIDC_CLIENT_ID`
@@ -58,17 +61,17 @@ server-side token redemption when a redirect URI is registered as SPA.
   │
   ▼
   /oauth2/callback  ──► JS fetch(POST <issuer>/token, ...)        ← browser sets Origin
-                        JS fetch(POST /oauth2/session, tokens)    ← backend verifies + seals cookie
+                        JS fetch(POST /oauth2/session, tokens)    ← backend verifies + writes cookies
                         window.location = <original URL>
 ```
 
 ## Token refresh
 
-When `/verify` finds the cookie's ID token has expired, it redirects to
-`/oauth2/refresh`. That page asks the backend for the refresh token
-(same-origin only), POSTs it to the issuer's token endpoint from the
-browser, then POSTs the new tokens back to `/oauth2/session`. Same
-"browser does the request" pattern as sign-in.
+When `/verify` finds the ID-token cookie no longer verifies, it
+redirects to `/oauth2/refresh`. That page reads the refresh token
+straight from `document.cookie` (no backend roundtrip), POSTs it to the
+issuer's token endpoint from the browser, then POSTs the new tokens
+back to `/oauth2/session`.
 
 ## Quick start
 
@@ -99,7 +102,6 @@ The two routes you need on the same host:
 ```bash
 OIDC_ISSUER=https://accounts.google.com
 OIDC_CLIENT_ID=xxxx.apps.googleusercontent.com
-COOKIE_SECRET=$(openssl rand -base64 32)   # recommended
 ```
 
 ## Endpoints
@@ -110,10 +112,9 @@ COOKIE_SECRET=$(openssl rand -base64 32)   # recommended
 | `/oauth2/sign_in` | GET | HTML login screen with a single button |
 | `/oauth2/start` | GET | JS page: generates PKCE & redirects to issuer |
 | `/oauth2/callback` | GET | JS page: exchanges code in-browser, posts tokens to backend |
-| `/oauth2/session` | POST | Backend: verifies ID token, seals encrypted cookie (same-origin only) |
-| `/oauth2/refresh` | GET | JS page: refreshes tokens in-browser |
-| `/oauth2/refresh_token` | GET | Backend: returns refresh token to the refresh page (same-origin only) |
-| `/oauth2/sign_out` | GET | Clears the session cookie |
+| `/oauth2/session` | POST | Backend: verifies ID token, writes cookies (same-origin only) |
+| `/oauth2/refresh` | GET | JS page: refreshes tokens in-browser (reads `document.cookie`) |
+| `/oauth2/sign_out` | GET | Clears the token cookies |
 | `/healthz` | GET | `204 No Content` |
 
 `sign_in`, `start`, and `refresh` accept an `rd` query param to preserve
@@ -126,8 +127,7 @@ the destination URL across the redirects.
 | `OIDC_ISSUER` | yes | — | Discovery base URL (e.g. `https://accounts.google.com`) |
 | `OIDC_CLIENT_ID` | yes | — | Public client ID |
 | `OIDC_SCOPES` | no | `openid profile email` | Space-separated; `openid` is auto-added if missing |
-| `COOKIE_SECRET` | no | random per start | 16/24/32-byte base64. If unset, sessions die on restart |
-| `COOKIE_NAME_PREFIX` | no | `_oidc_proxy` | Cookie name prefix |
+| `COOKIE_NAME_PREFIX` | no | `_oidc_proxy` | Prefix for `_id_token` / `_access_token` / `_refresh_token` |
 | `COOKIE_DOMAIN` | no | request host | Set to share across subdomains |
 | `COOKIE_SECURE` | no | `true` | Set to `false` only for local HTTP testing |
 | `ALLOWED_EMAILS` | no | — | Comma-separated allowlist of emails |
@@ -180,18 +180,20 @@ Standard SPA / public-client registration with PKCE. No special setup.
 
 ## Security model
 
-- The ID token and refresh token are stored in an **HttpOnly,
-  AES-GCM-encrypted cookie** (chunked across `<prefix>_session_N` cookies
-  so each stays under the 4KB browser per-cookie limit). The access
-  token isn't stored — nothing on the backend reads it, and oidc-proxy
-  doesn't proxy requests upstream.
-- The refresh token is briefly readable by the JS on
-  `/oauth2/refresh` (and only there). CORS and `SameSite=Lax` prevent
-  cross-origin reads.
-- `POST /oauth2/session` and `GET /oauth2/refresh_token` enforce
-  `Origin == X-Forwarded-Host`, blocking CSRF-style session injection.
+- The ID, access, and refresh tokens are written to three separate
+  plaintext cookies on `<prefix>_id_token`, `<prefix>_access_token`,
+  `<prefix>_refresh_token` — all `Secure`, `SameSite=Lax`, **not**
+  `HttpOnly` so the static site's JS can read them. This is an
+  intentional trade-off: the SPA flow already exposes the tokens to JS
+  during sign-in, and JS-readable cookies remove backend roundtrips
+  (the refresh page reads the refresh token directly; the static site
+  can call APIs with the access token without asking the backend).
+  Treat the cookies as you would any client-side token storage.
+- `POST /oauth2/session` enforces `Origin == X-Forwarded-Host`,
+  blocking session-fixation attacks where a third-party site tries to
+  install tokens into the user's browser.
 - On every protected request, the backend re-verifies the ID token via
-  JWKS (cached by `go-oidc`) — not just the expiry hint in the cookie.
+  JWKS (cached by `go-oidc`) — never trusts the cookie blindly.
 - Open-redirects are blocked: `rd` only accepts same-origin absolute paths.
 
 ## Build & run locally

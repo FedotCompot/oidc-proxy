@@ -9,35 +9,42 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-
-	"github.com/coreos/go-oidc/v3/oidc"
 )
 
 func newTestServer(t *testing.T) *Server {
 	t.Helper()
-	key := make([]byte, 32)
-	for i := range key {
-		key[i] = byte(i)
-	}
 	return &Server{
 		cfg: Config{
 			ClientID:     "test-client",
 			CookiePrefix: "_oidc_proxy",
-			CookieKey:    key,
 			SignInTitle:  "Sign in",
 			SignInButton: "Sign in with SSO",
 			Scopes:       []string{"openid", "profile", "email"},
 		},
-		verifyFn: func(_ context.Context, tok string) (*oidc.IDToken, error) {
+		verifyFn: func(_ context.Context, tok string) (*VerifiedToken, error) {
 			if tok == "valid" {
-				return &oidc.IDToken{Subject: "stub-sub", Nonce: "stub-nonce"}, nil
+				return &VerifiedToken{Subject: "stub-sub", Nonce: "stub-nonce"}, nil
 			}
 			return nil, errors.New("invalid id_token")
 		},
 	}
 }
 
-func TestVerifyRedirectsWhenNoSession(t *testing.T) {
+// addTokenCookies puts plain token cookies on req with the same names the
+// production code uses.
+func addTokenCookies(req *http.Request, s *Server, t Tokens) {
+	if t.IDToken != "" {
+		req.AddCookie(&http.Cookie{Name: s.cookieName(cookieSuffixIDToken), Value: t.IDToken})
+	}
+	if t.AccessToken != "" {
+		req.AddCookie(&http.Cookie{Name: s.cookieName(cookieSuffixAccessToken), Value: t.AccessToken})
+	}
+	if t.RefreshToken != "" {
+		req.AddCookie(&http.Cookie{Name: s.cookieName(cookieSuffixRefreshToken), Value: t.RefreshToken})
+	}
+}
+
+func TestVerifyRedirectsWhenNoToken(t *testing.T) {
 	s := newTestServer(t)
 	req := httptest.NewRequest(http.MethodGet, "http://oidc-proxy:8080/verify", nil)
 	req.Header.Set("X-Forwarded-Proto", "https")
@@ -59,20 +66,19 @@ func TestVerifyRedirectsWhenNoSession(t *testing.T) {
 	}
 }
 
-func TestVerifyAllowsValidSession(t *testing.T) {
+func TestVerifyAllowsValidToken(t *testing.T) {
 	s := newTestServer(t)
-	sess := &Session{
-		IDToken: "valid",
-		Email:   "alice@example.com",
-		Subject: "alice-sub",
-	}
-	token, err := s.sealJSON(sess)
-	if err != nil {
-		t.Fatalf("seal: %v", err)
+	// verifyFn returns Subject="stub-sub" for the "valid" token; the email
+	// claim isn't populated, so X-Auth-Request-Email is expected empty here.
+	s.verifyFn = func(_ context.Context, tok string) (*VerifiedToken, error) {
+		if tok == "valid" {
+			return &VerifiedToken{Subject: "alice-sub", Email: "alice@example.com"}, nil
+		}
+		return nil, errors.New("invalid id_token")
 	}
 
 	req := httptest.NewRequest(http.MethodGet, "http://oidc-proxy:8080/verify", nil)
-	req.AddCookie(&http.Cookie{Name: s.sessionCookieName() + "_0", Value: token})
+	addTokenCookies(req, s, Tokens{IDToken: "valid"})
 	w := httptest.NewRecorder()
 
 	s.handleVerify(w, req)
@@ -90,17 +96,11 @@ func TestVerifyAllowsValidSession(t *testing.T) {
 
 func TestVerifyRedirectsToRefreshOnInvalidIDToken(t *testing.T) {
 	s := newTestServer(t)
-	sess := &Session{
-		IDToken:      "expired",
-		RefreshToken: "rt",
-	}
-	token, _ := s.sealJSON(sess)
-
 	req := httptest.NewRequest(http.MethodGet, "http://oidc-proxy:8080/verify", nil)
 	req.Header.Set("X-Forwarded-Proto", "https")
 	req.Header.Set("X-Forwarded-Host", "app.example.com")
 	req.Header.Set("X-Forwarded-Uri", "/some/page")
-	req.AddCookie(&http.Cookie{Name: s.sessionCookieName() + "_0", Value: token})
+	addTokenCookies(req, s, Tokens{IDToken: "expired", RefreshToken: "rt"})
 	w := httptest.NewRecorder()
 
 	s.handleVerify(w, req)
@@ -115,13 +115,10 @@ func TestVerifyRedirectsToRefreshOnInvalidIDToken(t *testing.T) {
 
 func TestVerifyRedirectsToSignInWhenNoRefreshToken(t *testing.T) {
 	s := newTestServer(t)
-	sess := &Session{IDToken: "expired"}
-	token, _ := s.sealJSON(sess)
-
 	req := httptest.NewRequest(http.MethodGet, "http://oidc-proxy:8080/verify", nil)
 	req.Header.Set("X-Forwarded-Proto", "https")
 	req.Header.Set("X-Forwarded-Host", "app.example.com")
-	req.AddCookie(&http.Cookie{Name: s.sessionCookieName() + "_0", Value: token})
+	addTokenCookies(req, s, Tokens{IDToken: "expired"})
 	w := httptest.NewRecorder()
 
 	s.handleVerify(w, req)
@@ -137,14 +134,11 @@ func TestVerifyRedirectsToSignInWhenNoRefreshToken(t *testing.T) {
 func TestVerifyDeniesDisallowedEmail(t *testing.T) {
 	s := newTestServer(t)
 	s.cfg.AllowedDomains = map[string]bool{"example.com": true}
-	sess := &Session{
-		IDToken: "valid",
-		Email:   "mallory@evil.test",
+	s.verifyFn = func(_ context.Context, tok string) (*VerifiedToken, error) {
+		return &VerifiedToken{Subject: "x", Email: "mallory@evil.test"}, nil
 	}
-	token, _ := s.sealJSON(sess)
-
 	req := httptest.NewRequest(http.MethodGet, "http://oidc-proxy:8080/verify", nil)
-	req.AddCookie(&http.Cookie{Name: s.sessionCookieName() + "_0", Value: token})
+	addTokenCookies(req, s, Tokens{IDToken: "valid"})
 	w := httptest.NewRecorder()
 
 	s.handleVerify(w, req)
@@ -171,11 +165,12 @@ func TestSessionEndpointRejectsBadOrigin(t *testing.T) {
 	}
 }
 
-func TestSessionEndpointVerifiesAndSealsCookie(t *testing.T) {
+func TestSessionEndpointWritesPlainCookies(t *testing.T) {
 	s := newTestServer(t)
 	body, _ := json.Marshal(map[string]any{
 		"id_token":      "valid",
-		"refresh_token": "rt",
+		"access_token":  "at-value",
+		"refresh_token": "rt-value",
 		"nonce":         "stub-nonce",
 	})
 	req := httptest.NewRequest(http.MethodPost, "http://oidc-proxy:8080/oauth2/session", bytes.NewReader(body))
@@ -190,20 +185,51 @@ func TestSessionEndpointVerifiesAndSealsCookie(t *testing.T) {
 	if w.Code != http.StatusNoContent {
 		t.Fatalf("status = %d, want 204 (body=%s)", w.Code, w.Body.String())
 	}
-	// Round-trip the Set-Cookie chunks back through readSession.
-	next := httptest.NewRequest(http.MethodGet, "http://oidc-proxy:8080/verify", nil)
-	for _, c := range w.Result().Cookies() {
-		if c.MaxAge == -1 {
-			continue // skip cleanup-cookies for higher chunk indices
+
+	cookies := w.Result().Cookies()
+	want := map[string]string{
+		"_oidc_proxy_id_token":      "valid",
+		"_oidc_proxy_access_token":  "at-value",
+		"_oidc_proxy_refresh_token": "rt-value",
+	}
+	got := map[string]string{}
+	for _, c := range cookies {
+		got[c.Name] = c.Value
+		if c.HttpOnly {
+			t.Errorf("cookie %s set HttpOnly; expected JS-readable", c.Name)
 		}
-		next.AddCookie(&http.Cookie{Name: c.Name, Value: c.Value})
 	}
-	sess, err := s.readSession(next)
-	if err != nil {
-		t.Fatalf("readSession: %v", err)
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("cookie %s = %q, want %q", k, got[k], v)
+		}
 	}
-	if sess.IDToken != "valid" || sess.RefreshToken != "rt" || sess.Subject != "stub-sub" {
-		t.Fatalf("unexpected session contents: %+v", sess)
+}
+
+func TestSessionEndpointPreservesRefreshTokenWhenOmitted(t *testing.T) {
+	s := newTestServer(t)
+	body, _ := json.Marshal(map[string]any{"id_token": "valid"})
+	req := httptest.NewRequest(http.MethodPost, "http://oidc-proxy:8080/oauth2/session", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Origin", "https://app.example.com")
+	req.Header.Set("X-Forwarded-Proto", "https")
+	req.Header.Set("X-Forwarded-Host", "app.example.com")
+	req.AddCookie(&http.Cookie{Name: s.cookieName(cookieSuffixRefreshToken), Value: "carried-rt"})
+	w := httptest.NewRecorder()
+
+	s.handleSession(w, req)
+
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", w.Code)
+	}
+	var rtCookie *http.Cookie
+	for _, c := range w.Result().Cookies() {
+		if c.Name == s.cookieName(cookieSuffixRefreshToken) {
+			rtCookie = c
+		}
+	}
+	if rtCookie == nil || rtCookie.Value != "carried-rt" {
+		t.Fatalf("refresh_token cookie not carried forward: %+v", rtCookie)
 	}
 }
 
@@ -241,32 +267,30 @@ func TestSessionEndpointRejectsNonceMismatch(t *testing.T) {
 	}
 }
 
-func TestRefreshTokenEndpointReturnsToken(t *testing.T) {
+func TestSignOutClearsAllTokenCookies(t *testing.T) {
 	s := newTestServer(t)
-	sess := &Session{RefreshToken: "rt-value", IDToken: "valid"}
-	tok, _ := s.sealJSON(sess)
-
-	req := httptest.NewRequest(http.MethodGet, "http://oidc-proxy:8080/oauth2/refresh_token", nil)
-	req.Header.Set("Origin", "https://app.example.com")
-	req.Header.Set("X-Forwarded-Proto", "https")
-	req.Header.Set("X-Forwarded-Host", "app.example.com")
-	req.AddCookie(&http.Cookie{Name: s.sessionCookieName() + "_0", Value: tok})
+	req := httptest.NewRequest(http.MethodGet, "http://oidc-proxy:8080/oauth2/sign_out", nil)
 	w := httptest.NewRecorder()
 
-	s.handleRefreshToken(w, req)
+	s.handleSignOut(w, req)
 
-	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200 (body=%s)", w.Code, w.Body.String())
+	want := map[string]bool{
+		"_oidc_proxy_id_token":      false,
+		"_oidc_proxy_access_token":  false,
+		"_oidc_proxy_refresh_token": false,
 	}
-	var body map[string]string
-	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
-		t.Fatalf("decode: %v", err)
+	for _, c := range w.Result().Cookies() {
+		if _, ok := want[c.Name]; ok {
+			if c.MaxAge != -1 {
+				t.Errorf("cookie %s MaxAge = %d, want -1 (delete)", c.Name, c.MaxAge)
+			}
+			want[c.Name] = true
+		}
 	}
-	if body["refresh_token"] != "rt-value" {
-		t.Fatalf("refresh_token = %q", body["refresh_token"])
-	}
-	if body["client_id"] != "test-client" {
-		t.Fatalf("client_id = %q", body["client_id"])
+	for k, seen := range want {
+		if !seen {
+			t.Errorf("cookie %s not cleared", k)
+		}
 	}
 }
 
@@ -306,47 +330,6 @@ func TestSignInRendersHTML(t *testing.T) {
 	}
 }
 
-func TestSessionCookieChunksAndRoundTrips(t *testing.T) {
-	s := newTestServer(t)
-	// ~6KB ID token + ~1.5KB refresh token: forces multi-cookie split.
-	sess := &Session{
-		IDToken:      strings.Repeat("X", 6000),
-		RefreshToken: strings.Repeat("Y", 1500),
-		Email:        "alice@example.com",
-		Subject:      "alice-sub",
-	}
-
-	w := httptest.NewRecorder()
-	if err := s.writeSession(w, sess); err != nil {
-		t.Fatalf("writeSession: %v", err)
-	}
-
-	var chunks int
-	next := httptest.NewRequest(http.MethodGet, "http://oidc-proxy:8080/verify", nil)
-	for _, c := range w.Result().Cookies() {
-		if c.MaxAge == -1 {
-			continue
-		}
-		if len(c.Value) > 4000 {
-			t.Errorf("chunk %q is %d bytes — exceeds per-cookie limit", c.Name, len(c.Value))
-		}
-		chunks++
-		next.AddCookie(&http.Cookie{Name: c.Name, Value: c.Value})
-	}
-	if chunks < 2 {
-		t.Fatalf("expected >=2 chunks for an oversized payload, got %d", chunks)
-	}
-
-	got, err := s.readSession(next)
-	if err != nil {
-		t.Fatalf("readSession: %v", err)
-	}
-	if got.IDToken != sess.IDToken || got.RefreshToken != sess.RefreshToken ||
-		got.Email != sess.Email || got.Subject != sess.Subject {
-		t.Fatalf("round-trip mismatch")
-	}
-}
-
 func TestStartRendersJSPage(t *testing.T) {
 	s := newTestServer(t)
 	s.endpoints.AuthURL = "https://issuer.example.com/authorize"
@@ -361,14 +344,38 @@ func TestStartRendersJSPage(t *testing.T) {
 	}
 	body := w.Body.String()
 	for _, want := range []string{
-		"test-client",                            // client_id injected
-		"https://issuer.example.com/authorize",   // authorize endpoint injected
-		"sessionStorage.setItem('oidc.verifier",  // PKCE bits present
-		"code_challenge_method",                  // PKCE param wired
-		"/page",                                  // redirect injected
+		"test-client",                           // client_id injected
+		"https://issuer.example.com/authorize",  // authorize endpoint injected
+		"sessionStorage.setItem('oidc.verifier", // PKCE bits present
+		"code_challenge_method",                 // PKCE param wired
+		"/page",                                 // redirect injected
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("start page missing %q\nbody:\n%s", want, body)
 		}
 	}
 }
+
+func TestRefreshPageReadsCookieDirectly(t *testing.T) {
+	s := newTestServer(t)
+	s.endpoints.TokenURL = "https://issuer.example.com/token"
+	req := httptest.NewRequest(http.MethodGet, "http://oidc-proxy:8080/oauth2/refresh?rd=/page", nil)
+	w := httptest.NewRecorder()
+
+	s.handleRefresh(w, req)
+
+	body := w.Body.String()
+	for _, want := range []string{
+		"readCookie(cookiePrefix + '_refresh_token')", // direct cookie read
+		`"_oidc_proxy"`, // cookie prefix interpolated
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("refresh page missing %q\nbody:\n%s", want, body)
+		}
+	}
+	// Make sure we no longer call the removed /oauth2/refresh_token endpoint.
+	if strings.Contains(body, "/oauth2/refresh_token") {
+		t.Errorf("refresh page still references the removed /oauth2/refresh_token endpoint")
+	}
+}
+

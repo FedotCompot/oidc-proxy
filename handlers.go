@@ -13,39 +13,40 @@ import (
 
 // handleVerify is the Traefik ForwardAuth target.
 //
-// 200 → cookie carries a valid ID token (signature + iss/aud/exp check pass)
-// 302 → no/expired cookie; redirected to sign_in or refresh
+// 200 → id_token cookie verifies (signature + iss/aud/exp)
+// 302 → no/expired token; redirected to sign_in or refresh
 // 403 → authenticated but email not in the allowlist
 func (s *Server) handleVerify(w http.ResponseWriter, r *http.Request) {
-	sess, err := s.readSession(r)
-	if err != nil {
+	tokens := s.readTokens(r)
+	if tokens.IDToken == "" {
 		s.redirectToSignIn(w, r)
 		return
 	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
-	if _, err := s.verifyFn(ctx, sess.IDToken); err != nil {
-		if sess.RefreshToken != "" {
+	idTok, err := s.verifyFn(ctx, tokens.IDToken)
+	if err != nil {
+		if tokens.RefreshToken != "" {
 			s.redirectToRefresh(w, r)
 			return
 		}
-		s.clearSession(w)
+		s.clearTokens(w)
 		s.redirectToSignIn(w, r)
 		return
 	}
 
-	if !s.userAllowed(sess.Email) {
-		s.clearSession(w)
+	if !s.userAllowed(idTok.Email) {
+		s.clearTokens(w)
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
 
-	if sess.Email != "" {
-		w.Header().Set("X-Auth-Request-Email", sess.Email)
+	if idTok.Email != "" {
+		w.Header().Set("X-Auth-Request-Email", idTok.Email)
 	}
-	if sess.Subject != "" {
-		w.Header().Set("X-Auth-Request-User", sess.Subject)
+	if idTok.Subject != "" {
+		w.Header().Set("X-Auth-Request-User", idTok.Subject)
 	}
 	w.WriteHeader(http.StatusOK)
 }
@@ -64,9 +65,9 @@ func (s *Server) handleSignIn(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleStart serves a tiny HTML+JS page that generates a PKCE verifier,
-// state, and nonce in the browser, stashes them in sessionStorage, then
-// redirects to the provider's authorize endpoint. Nothing is exchanged here.
+// handleStart serves an HTML+JS page that generates PKCE verifier+state+nonce
+// in the browser, stashes them in sessionStorage, then redirects to the
+// provider's authorize endpoint.
 func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 	rd := sanitizeRedirect(r.URL.Query().Get("rd"))
 	if rd == "" {
@@ -77,26 +78,29 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 		Scopes:            strings.Join(s.cfg.Scopes, " "),
 		AuthorizeEndpoint: s.endpoints.AuthURL,
 		TokenEndpoint:     s.endpoints.TokenURL,
+		CookiePrefix:      s.cfg.CookiePrefix,
 		Redirect:          rd,
 	})
 }
 
-// handleCallback serves a tiny HTML+JS page that finishes the OIDC flow in
-// the browser: it reads the code from the URL, calls the token endpoint via
-// fetch() (so the browser sets the `Origin` header — required by Entra SPA),
-// and POSTs the tokens to /oauth2/session for verification + cookie sealing.
+// handleCallback serves an HTML+JS page that finishes the OIDC flow in the
+// browser: reads the code from the URL, calls the provider's token endpoint
+// via fetch() (the browser sets `Origin`, satisfying Entra's SPA check), and
+// POSTs the tokens to /oauth2/session for verification + cookie write.
 func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 	s.renderHTML(w, callbackTemplate, flowData{
 		ClientID:          s.cfg.ClientID,
 		Scopes:            strings.Join(s.cfg.Scopes, " "),
 		AuthorizeEndpoint: s.endpoints.AuthURL,
 		TokenEndpoint:     s.endpoints.TokenURL,
+		CookiePrefix:      s.cfg.CookiePrefix,
 	})
 }
 
-// handleRefresh serves a tiny HTML+JS page that fetches the refresh token
-// from the backend, calls the token endpoint in the browser, and POSTs the
-// new tokens back to /oauth2/session.
+// handleRefresh serves an HTML+JS page that reads the refresh_token cookie
+// directly (no backend roundtrip needed — cookies are JS-readable), calls
+// the provider's token endpoint in the browser, then POSTs the new tokens
+// back to /oauth2/session.
 func (s *Server) handleRefresh(w http.ResponseWriter, r *http.Request) {
 	rd := sanitizeRedirect(r.URL.Query().Get("rd"))
 	if rd == "" {
@@ -107,15 +111,16 @@ func (s *Server) handleRefresh(w http.ResponseWriter, r *http.Request) {
 		Scopes:            strings.Join(s.cfg.Scopes, " "),
 		AuthorizeEndpoint: s.endpoints.AuthURL,
 		TokenEndpoint:     s.endpoints.TokenURL,
+		CookiePrefix:      s.cfg.CookiePrefix,
 		Redirect:          rd,
 	})
 }
 
-// handleSession receives the tokens the browser obtained from the provider,
-// verifies the ID token, and seals an encrypted HttpOnly cookie. This is the
-// only place the backend touches the tokens, and it never makes outbound
-// calls to the provider's token endpoint — only inbound JWKS lookups (cached
-// by go-oidc) during ID token verification.
+// handleSession verifies the ID token the browser obtained from the
+// provider and writes the tokens as individual JS-readable cookies. This is
+// the only endpoint where the backend touches tokens; it never calls the
+// provider's token endpoint, only fetches JWKS (cached by go-oidc) to
+// verify signatures. Same-origin guard blocks session-fixation attacks.
 func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -128,6 +133,7 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 
 	var body struct {
 		IDToken      string `json:"id_token"`
+		AccessToken  string `json:"access_token"`
 		RefreshToken string `json:"refresh_token"`
 		Nonce        string `json:"nonce"`
 	}
@@ -153,60 +159,27 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var claims struct {
-		Email string `json:"email"`
-	}
-	_ = idTok.Claims(&claims)
-
-	if !s.userAllowed(claims.Email) {
+	if !s.userAllowed(idTok.Email) {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
 
-	// Preserve a refresh token from a prior session if the new response omits
-	// one (some IdPs only return refresh_token on the initial exchange).
+	// Some IdPs only return refresh_token on the initial exchange; carry the
+	// existing one forward if the new response omits it.
 	if body.RefreshToken == "" {
-		if prev, err := s.readSession(r); err == nil {
-			body.RefreshToken = prev.RefreshToken
-		}
+		body.RefreshToken = cookieValue(r, s.cookieName(cookieSuffixRefreshToken))
 	}
 
-	sess := &Session{
+	s.writeTokens(w, Tokens{
 		IDToken:      body.IDToken,
+		AccessToken:  body.AccessToken,
 		RefreshToken: body.RefreshToken,
-		Email:        claims.Email,
-		Subject:      idTok.Subject,
-	}
-	if err := s.writeSession(w, sess); err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
+	})
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// handleRefreshToken hands the refresh token back to the browser so the
-// /oauth2/refresh page can call the provider's token endpoint itself.
-// Same-origin only; the response is JSON and CORS blocks cross-origin reads.
-func (s *Server) handleRefreshToken(w http.ResponseWriter, r *http.Request) {
-	if !s.sameOrigin(r) {
-		http.Error(w, "bad origin", http.StatusForbidden)
-		return
-	}
-	sess, err := s.readSession(r)
-	if err != nil || sess.RefreshToken == "" {
-		http.Error(w, "no refresh token", http.StatusUnauthorized)
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Cache-Control", "no-store")
-	_ = json.NewEncoder(w).Encode(map[string]string{
-		"refresh_token": sess.RefreshToken,
-		"client_id":     s.cfg.ClientID,
-	})
-}
-
 func (s *Server) handleSignOut(w http.ResponseWriter, r *http.Request) {
-	s.clearSession(w)
+	s.clearTokens(w)
 	rd := sanitizeRedirect(r.URL.Query().Get("rd"))
 	if rd == "" {
 		rd = "/"
@@ -228,20 +201,11 @@ func (s *Server) renderHTML(w http.ResponseWriter, t *template.Template, data an
 	}
 }
 
-// sameOrigin guards same-origin-only endpoints (POST /oauth2/session and GET
-// /oauth2/refresh_token). It rejects requests whose Origin header doesn't
-// match the forwarded host.
+// sameOrigin guards /oauth2/session against session-fixation: only accept
+// POSTs whose Origin matches the forwarded host.
 func (s *Server) sameOrigin(r *http.Request) bool {
 	got := r.Header.Get("Origin")
 	if got == "" {
-		// Some browsers omit Origin on same-origin GET; accept Referer fallback
-		// only when no Origin is set at all (POST always has Origin set).
-		if r.Method == http.MethodGet {
-			if ref := r.Header.Get("Referer"); ref != "" {
-				return originOf(ref) == s.expectedOrigin(r)
-			}
-			return true
-		}
 		return false
 	}
 	return got == s.expectedOrigin(r)
@@ -341,4 +305,3 @@ func originOf(rawURL string) string {
 	}
 	return u.Scheme + "://" + u.Host
 }
-

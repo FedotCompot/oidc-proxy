@@ -1,161 +1,70 @@
 package main
 
 import (
-	"crypto/aes"
-	"crypto/cipher"
-	"crypto/rand"
-	"encoding/base64"
-	"encoding/json"
-	"errors"
 	"net/http"
-	"strconv"
 	"time"
 )
 
-// Session is the encrypted payload stored in the session cookie.
-//
-// The access token isn't kept: oidc-proxy doesn't proxy upstream requests,
-// so nothing reads it. Dropping it saves ~2KB on Entra and keeps the cookie
-// under the 4KB browser limit in most cases.
-type Session struct {
-	IDToken      string `json:"i,omitempty"`
-	RefreshToken string `json:"r,omitempty"`
-	Email        string `json:"m,omitempty"`
-	Subject      string `json:"s,omitempty"`
-}
-
 const (
-	sessionCookieSuffix = "_session"
-	// cookieChunkSize caps each cookie's value below the 4KB-per-cookie limit
-	// most browsers enforce, leaving headroom for the name and attributes.
-	cookieChunkSize = 3800
-	// maxCookieChunks bounds the loop that reads/clears chunks. 8 chunks of
-	// 3800 bytes is ~30KB sealed, which is far more than any sane token set.
-	maxCookieChunks = 8
+	cookieSuffixIDToken      = "_id_token"
+	cookieSuffixAccessToken  = "_access_token"
+	cookieSuffixRefreshToken = "_refresh_token"
 )
 
-func (s *Server) sessionCookieName() string { return s.cfg.CookiePrefix + sessionCookieSuffix }
-
-func (s *Server) sealJSON(v any) (string, error) {
-	raw, err := json.Marshal(v)
-	if err != nil {
-		return "", err
-	}
-	block, err := aes.NewCipher(s.cfg.CookieKey)
-	if err != nil {
-		return "", err
-	}
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return "", err
-	}
-	nonce := make([]byte, gcm.NonceSize())
-	if _, err := rand.Read(nonce); err != nil {
-		return "", err
-	}
-	out := gcm.Seal(nonce, nonce, raw, nil)
-	return base64.RawURLEncoding.EncodeToString(out), nil
+// Tokens is the set of OAuth/OIDC tokens we mirror into individual cookies.
+// The cookies are plaintext and JS-readable — the static site's JS already
+// touches them during the SPA flow, so HttpOnly would protect nothing.
+type Tokens struct {
+	IDToken      string
+	AccessToken  string
+	RefreshToken string
 }
 
-func (s *Server) openJSON(token string, v any) error {
-	data, err := base64.RawURLEncoding.DecodeString(token)
-	if err != nil {
-		return err
+func (s *Server) cookieName(suffix string) string { return s.cfg.CookiePrefix + suffix }
+
+func (s *Server) readTokens(r *http.Request) Tokens {
+	return Tokens{
+		IDToken:      cookieValue(r, s.cookieName(cookieSuffixIDToken)),
+		AccessToken:  cookieValue(r, s.cookieName(cookieSuffixAccessToken)),
+		RefreshToken: cookieValue(r, s.cookieName(cookieSuffixRefreshToken)),
 	}
-	block, err := aes.NewCipher(s.cfg.CookieKey)
-	if err != nil {
-		return err
-	}
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return err
-	}
-	if len(data) < gcm.NonceSize() {
-		return errors.New("ciphertext too short")
-	}
-	nonce, ct := data[:gcm.NonceSize()], data[gcm.NonceSize():]
-	raw, err := gcm.Open(nil, nonce, ct, nil)
-	if err != nil {
-		return err
-	}
-	return json.Unmarshal(raw, v)
 }
 
-// readSession reassembles the sealed token from one or more chunk cookies
-// (`<prefix>_session_0`, `<prefix>_session_1`, …) and decrypts it.
-func (s *Server) readSession(r *http.Request) (*Session, error) {
-	base := s.sessionCookieName()
-	var token string
-	for i := 0; i < maxCookieChunks; i++ {
-		c, err := r.Cookie(base + "_" + strconv.Itoa(i))
-		if err != nil {
-			break
-		}
-		token += c.Value
+func cookieValue(r *http.Request, name string) string {
+	c, err := r.Cookie(name)
+	if err != nil {
+		return ""
 	}
-	if token == "" {
-		return nil, http.ErrNoCookie
-	}
-	var sess Session
-	if err := s.openJSON(token, &sess); err != nil {
-		return nil, err
-	}
-	return &sess, nil
+	return c.Value
 }
 
-// writeSession seals the payload and splits it across `<prefix>_session_N`
-// cookies so each stays under the 4KB per-cookie browser limit. It also
-// issues delete cookies for any higher-index chunks left over from a larger
-// prior session.
-func (s *Server) writeSession(w http.ResponseWriter, sess *Session) error {
-	token, err := s.sealJSON(sess)
-	if err != nil {
-		return err
-	}
-	base := s.sessionCookieName()
+func (s *Server) writeTokens(w http.ResponseWriter, t Tokens) {
 	exp := time.Now().Add(30 * 24 * time.Hour)
-
-	chunks := chunkString(token, cookieChunkSize)
-	for i, c := range chunks {
-		http.SetCookie(w, s.makeCookie(base+"_"+strconv.Itoa(i), c, exp, "/"))
+	if t.IDToken != "" {
+		http.SetCookie(w, s.makeCookie(s.cookieName(cookieSuffixIDToken), t.IDToken, exp))
 	}
-	// Best-effort cleanup of leftover chunks from any prior, larger session.
-	for i := len(chunks); i < maxCookieChunks; i++ {
-		http.SetCookie(w, s.makeCookie(base+"_"+strconv.Itoa(i), "", time.Unix(0, 0), "/"))
+	if t.AccessToken != "" {
+		http.SetCookie(w, s.makeCookie(s.cookieName(cookieSuffixAccessToken), t.AccessToken, exp))
 	}
-	return nil
-}
-
-func (s *Server) clearSession(w http.ResponseWriter) {
-	base := s.sessionCookieName()
-	for i := 0; i < maxCookieChunks; i++ {
-		http.SetCookie(w, s.makeCookie(base+"_"+strconv.Itoa(i), "", time.Unix(0, 0), "/"))
+	if t.RefreshToken != "" {
+		http.SetCookie(w, s.makeCookie(s.cookieName(cookieSuffixRefreshToken), t.RefreshToken, exp))
 	}
 }
 
-func chunkString(s string, n int) []string {
-	if len(s) <= n {
-		return []string{s}
+func (s *Server) clearTokens(w http.ResponseWriter) {
+	for _, suffix := range []string{cookieSuffixIDToken, cookieSuffixAccessToken, cookieSuffixRefreshToken} {
+		http.SetCookie(w, s.makeCookie(s.cookieName(suffix), "", time.Unix(0, 0)))
 	}
-	out := make([]string, 0, (len(s)+n-1)/n)
-	for i := 0; i < len(s); i += n {
-		end := i + n
-		if end > len(s) {
-			end = len(s)
-		}
-		out = append(out, s[i:end])
-	}
-	return out
 }
 
-func (s *Server) makeCookie(name, value string, expires time.Time, path string) *http.Cookie {
+func (s *Server) makeCookie(name, value string, expires time.Time) *http.Cookie {
 	c := &http.Cookie{
 		Name:     name,
 		Value:    value,
-		Path:     path,
+		Path:     "/",
 		Domain:   s.cfg.CookieDomain,
 		Expires:  expires,
-		HttpOnly: true,
+		HttpOnly: false, // JS-readable: the static site needs to read tokens
 		Secure:   s.cfg.CookieSecure,
 		SameSite: http.SameSiteLaxMode,
 	}
