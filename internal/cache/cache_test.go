@@ -1,4 +1,4 @@
-package main
+package cache
 
 import (
 	"context"
@@ -6,15 +6,17 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/fedot/oidc-proxy/internal/token"
 )
 
 func TestCacheReturnsMemoizedResult(t *testing.T) {
 	var calls int32
-	inner := func(_ context.Context, tok string) (*VerifiedToken, error) {
+	inner := func(_ context.Context, tok string) (*token.Verified, error) {
 		atomic.AddInt32(&calls, 1)
-		return &VerifiedToken{Subject: "alice", Email: "alice@example.com", Expiry: time.Now().Add(time.Hour)}, nil
+		return &token.Verified{Subject: "alice", Email: "alice@example.com", Expiry: time.Now().Add(time.Hour)}, nil
 	}
-	verify := withCache(inner, newTokenCache(8))
+	verify := Wrap(inner, New(8))
 
 	for i := 0; i < 5; i++ {
 		v, err := verify(context.Background(), "the-jwt")
@@ -31,16 +33,16 @@ func TestCacheReturnsMemoizedResult(t *testing.T) {
 }
 
 func TestCacheExpiresAtTokenExp(t *testing.T) {
-	c := newTokenCache(8)
+	c := New(8)
 
 	var calls int32
-	inner := func(_ context.Context, tok string) (*VerifiedToken, error) {
+	inner := func(_ context.Context, tok string) (*token.Verified, error) {
 		atomic.AddInt32(&calls, 1)
 		// 50ms lifetime — short enough to expire within the test but long
 		// enough that a same-tick cache hit isn't racy.
-		return &VerifiedToken{Subject: "alice", Expiry: time.Now().Add(50 * time.Millisecond)}, nil
+		return &token.Verified{Subject: "alice", Expiry: time.Now().Add(50 * time.Millisecond)}, nil
 	}
-	verify := withCache(inner, c)
+	verify := Wrap(inner, c)
 
 	if _, err := verify(context.Background(), "tok"); err != nil {
 		t.Fatalf("first call: %v", err)
@@ -63,11 +65,11 @@ func TestCacheExpiresAtTokenExp(t *testing.T) {
 
 func TestCacheDoesNotMemoizeErrors(t *testing.T) {
 	var calls int32
-	inner := func(_ context.Context, tok string) (*VerifiedToken, error) {
+	inner := func(_ context.Context, tok string) (*token.Verified, error) {
 		atomic.AddInt32(&calls, 1)
 		return nil, errors.New("nope")
 	}
-	verify := withCache(inner, newTokenCache(8))
+	verify := Wrap(inner, New(8))
 
 	for i := 0; i < 3; i++ {
 		if _, err := verify(context.Background(), "tok"); err == nil {
@@ -80,11 +82,11 @@ func TestCacheDoesNotMemoizeErrors(t *testing.T) {
 }
 
 func TestCacheEvictsWhenFull(t *testing.T) {
-	c := newTokenCache(2)
-	inner := func(_ context.Context, tok string) (*VerifiedToken, error) {
-		return &VerifiedToken{Subject: tok, Expiry: time.Now().Add(time.Hour)}, nil
+	c := New(2)
+	inner := func(_ context.Context, tok string) (*token.Verified, error) {
+		return &token.Verified{Subject: tok, Expiry: time.Now().Add(time.Hour)}, nil
 	}
-	verify := withCache(inner, c)
+	verify := Wrap(inner, c)
 
 	for _, tok := range []string{"a", "b", "c"} {
 		if _, err := verify(context.Background(), tok); err != nil {
@@ -97,33 +99,7 @@ func TestCacheEvictsWhenFull(t *testing.T) {
 }
 
 func TestCacheKeyDistinguishesTokens(t *testing.T) {
-	if cacheKey("abc") == cacheKey("abd") {
-		t.Fatalf("cacheKey collides on trivial inputs")
-	}
-}
-
-func TestCachedVerifyFromHandler(t *testing.T) {
-	// /verify should benefit from caching: two consecutive verify requests
-	// with the same id_token cookie should only hit the inner verifier once.
-	s := newTestServer(t)
-	var calls int32
-	inner := func(_ context.Context, tok string) (*VerifiedToken, error) {
-		atomic.AddInt32(&calls, 1)
-		if tok != "valid" {
-			return nil, errors.New("bad")
-		}
-		return &VerifiedToken{Subject: "alice", Email: "alice@example.com", Expiry: time.Now().Add(time.Hour)}, nil
-	}
-	s.verifyFn = withCache(inner, newTokenCache(8))
-
-	for i := 0; i < 4; i++ {
-		req := newAuthedRequest(s, "valid")
-		w := recordVerify(s, req)
-		if w.Code != 200 {
-			t.Fatalf("iteration %d: status = %d", i, w.Code)
-		}
-	}
-	if got := atomic.LoadInt32(&calls); got != 1 {
-		t.Fatalf("inner verifier called %d times across 4 /verify requests, want 1", got)
+	if key("abc") == key("abd") {
+		t.Fatalf("key collides on trivial inputs")
 	}
 }

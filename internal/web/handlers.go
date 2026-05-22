@@ -1,4 +1,4 @@
-package main
+package web
 
 import (
 	"context"
@@ -10,6 +10,8 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"github.com/fedot/oidc-proxy/internal/utils"
 )
 
 // handleVerify is the Traefik ForwardAuth target.
@@ -54,7 +56,7 @@ func (s *Server) handleVerify(w http.ResponseWriter, r *http.Request) {
 
 // handleSignIn is the minimal HTML login screen. Single button → /oauth2/start.
 func (s *Server) handleSignIn(w http.ResponseWriter, r *http.Request) {
-	rd := sanitizeRedirect(r.URL.Query().Get("rd"))
+	rd := utils.SanitizeRedirect(r.URL.Query().Get("rd"))
 	startURL := "/oauth2/start"
 	if rd != "" {
 		startURL += "?rd=" + url.QueryEscape(rd)
@@ -70,7 +72,7 @@ func (s *Server) handleSignIn(w http.ResponseWriter, r *http.Request) {
 // in the browser, stashes them in sessionStorage, then redirects to the
 // provider's authorize endpoint.
 func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
-	rd := sanitizeRedirect(r.URL.Query().Get("rd"))
+	rd := utils.SanitizeRedirect(r.URL.Query().Get("rd"))
 	if rd == "" {
 		rd = "/"
 	}
@@ -103,7 +105,7 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 // the provider's token endpoint in the browser, then POSTs the new tokens
 // back to /oauth2/session.
 func (s *Server) handleRefresh(w http.ResponseWriter, r *http.Request) {
-	rd := sanitizeRedirect(r.URL.Query().Get("rd"))
+	rd := utils.SanitizeRedirect(r.URL.Query().Get("rd"))
 	if rd == "" {
 		rd = "/"
 	}
@@ -181,7 +183,7 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleSignOut(w http.ResponseWriter, r *http.Request) {
 	s.clearTokens(w)
-	rd := sanitizeRedirect(r.URL.Query().Get("rd"))
+	rd := utils.SanitizeRedirect(r.URL.Query().Get("rd"))
 	if rd == "" {
 		rd = "/"
 	}
@@ -193,7 +195,7 @@ func (s *Server) renderHTML(w http.ResponseWriter, t *template.Template, data an
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Frame-Options", "DENY")
 	connect := "'self'"
-	if o := originOf(s.provider.Endpoint().TokenURL); o != "" {
+	if o := utils.OriginOf(s.provider.Endpoint().TokenURL); o != "" {
 		connect += " " + o
 	}
 	w.Header().Set("Content-Security-Policy", "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src "+connect)
@@ -213,11 +215,11 @@ func (s *Server) sameOrigin(r *http.Request) bool {
 }
 
 func (s *Server) expectedOrigin(r *http.Request) string {
-	return forwardedProto(r) + "://" + forwardedHost(r)
+	return utils.ForwardedProto(r) + "://" + utils.ForwardedHost(r)
 }
 
 func (s *Server) redirectToSignIn(w http.ResponseWriter, r *http.Request) {
-	s.redirectToSignInWith(w, r, originalURL(r))
+	s.redirectToSignInWith(w, r, utils.OriginalURL(r))
 }
 
 func (s *Server) redirectToSignInWith(w http.ResponseWriter, r *http.Request, rd string) {
@@ -229,7 +231,7 @@ func (s *Server) redirectToSignInWith(w http.ResponseWriter, r *http.Request, rd
 }
 
 func (s *Server) redirectToRefresh(w http.ResponseWriter, r *http.Request) {
-	u := s.expectedOrigin(r) + "/oauth2/refresh?rd=" + url.QueryEscape(originalURL(r))
+	u := s.expectedOrigin(r) + "/oauth2/refresh?rd=" + url.QueryEscape(utils.OriginalURL(r))
 	http.Redirect(w, r, u, http.StatusFound)
 }
 
@@ -247,62 +249,4 @@ func (s *Server) userAllowed(email string) bool {
 		}
 	}
 	return false
-}
-
-// forwardedProto / forwardedHost prefer Traefik-set headers, falling back to
-// the request itself so direct hits during local testing still work.
-func forwardedProto(r *http.Request) string {
-	if v := r.Header.Get("X-Forwarded-Proto"); v != "" {
-		return firstField(v)
-	}
-	if r.TLS != nil {
-		return "https"
-	}
-	return "http"
-}
-
-func forwardedHost(r *http.Request) string {
-	if v := r.Header.Get("X-Forwarded-Host"); v != "" {
-		return firstField(v)
-	}
-	return r.Host
-}
-
-// originalURL reconstructs the URL the user was originally trying to reach
-// using Traefik's X-Forwarded-* headers (Uri carries path+query).
-func originalURL(r *http.Request) string {
-	uri := r.Header.Get("X-Forwarded-Uri")
-	if uri == "" {
-		uri = "/"
-	}
-	if !strings.HasPrefix(uri, "/") {
-		uri = "/" + uri
-	}
-	return forwardedProto(r) + "://" + forwardedHost(r) + uri
-}
-
-// sanitizeRedirect blocks open-redirects: only same-origin paths are allowed.
-func sanitizeRedirect(raw string) string {
-	if raw == "" {
-		return ""
-	}
-	if strings.HasPrefix(raw, "/") && !strings.HasPrefix(raw, "//") {
-		return raw
-	}
-	return ""
-}
-
-func firstField(s string) string {
-	if i := strings.IndexByte(s, ','); i >= 0 {
-		s = s[:i]
-	}
-	return strings.TrimSpace(s)
-}
-
-func originOf(rawURL string) string {
-	u, err := url.Parse(rawURL)
-	if err != nil || u.Scheme == "" || u.Host == "" {
-		return ""
-	}
-	return u.Scheme + "://" + u.Host
 }

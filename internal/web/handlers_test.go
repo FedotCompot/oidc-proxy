@@ -1,4 +1,4 @@
-package main
+package web
 
 import (
 	"bytes"
@@ -9,9 +9,15 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/coreos/go-oidc/v3/oidc"
+
+	"github.com/fedot/oidc-proxy/internal/cache"
+	"github.com/fedot/oidc-proxy/internal/config"
+	"github.com/fedot/oidc-proxy/internal/token"
 )
 
 // fakeProvider stands up a minimal OIDC discovery server that publishes the
@@ -42,7 +48,7 @@ func fakeProvider(t *testing.T, authURL, tokenURL string) *oidc.Provider {
 func newTestServer(t *testing.T) *Server {
 	t.Helper()
 	return &Server{
-		cfg: Config{
+		cfg: config.Config{
 			ClientID:     "test-client",
 			CookiePrefix: "_oidc_proxy",
 			SignInTitle:  "Sign in",
@@ -50,9 +56,9 @@ func newTestServer(t *testing.T) *Server {
 			Scopes:       "openid profile email",
 		},
 		provider: fakeProvider(t, "https://issuer.example.com/authorize", "https://issuer.example.com/token"),
-		verifyFn: func(_ context.Context, tok string) (*VerifiedToken, error) {
+		verifyFn: func(_ context.Context, tok string) (*token.Verified, error) {
 			if tok == "valid" {
-				return &VerifiedToken{Subject: "stub-sub", Nonce: "stub-nonce"}, nil
+				return &token.Verified{Subject: "stub-sub", Nonce: "stub-nonce"}, nil
 			}
 			return nil, errors.New("invalid id_token")
 		},
@@ -113,9 +119,9 @@ func TestVerifyAllowsValidToken(t *testing.T) {
 	s := newTestServer(t)
 	// verifyFn returns Subject="stub-sub" for the "valid" token; the email
 	// claim isn't populated, so X-Auth-Request-Email is expected empty here.
-	s.verifyFn = func(_ context.Context, tok string) (*VerifiedToken, error) {
+	s.verifyFn = func(_ context.Context, tok string) (*token.Verified, error) {
 		if tok == "valid" {
-			return &VerifiedToken{Subject: "alice-sub", Email: "alice@example.com"}, nil
+			return &token.Verified{Subject: "alice-sub", Email: "alice@example.com"}, nil
 		}
 		return nil, errors.New("invalid id_token")
 	}
@@ -177,8 +183,8 @@ func TestVerifyRedirectsToSignInWhenNoRefreshToken(t *testing.T) {
 func TestVerifyDeniesDisallowedEmail(t *testing.T) {
 	s := newTestServer(t)
 	s.cfg.AllowedDomains = []string{"example.com"}
-	s.verifyFn = func(_ context.Context, tok string) (*VerifiedToken, error) {
-		return &VerifiedToken{Subject: "x", Email: "mallory@evil.test"}, nil
+	s.verifyFn = func(_ context.Context, tok string) (*token.Verified, error) {
+		return &token.Verified{Subject: "x", Email: "mallory@evil.test"}, nil
 	}
 	req := httptest.NewRequest(http.MethodGet, "http://oidc-proxy:8080/verify", nil)
 	addTokenCookies(req, s, Tokens{IDToken: "valid"})
@@ -337,23 +343,6 @@ func TestSignOutClearsAllTokenCookies(t *testing.T) {
 	}
 }
 
-func TestSanitizeRedirect(t *testing.T) {
-	cases := map[string]string{
-		"/foo":                "/foo",
-		"/":                   "/",
-		"":                    "",
-		"//evil.com/x":        "",
-		"https://evil.com/x":  "",
-		"javascript:alert(1)": "",
-		"/foo?x=1&y=2":        "/foo?x=1&y=2",
-	}
-	for in, want := range cases {
-		if got := sanitizeRedirect(in); got != want {
-			t.Errorf("sanitizeRedirect(%q) = %q, want %q", in, got, want)
-		}
-	}
-}
-
 func TestSignInRendersHTML(t *testing.T) {
 	s := newTestServer(t)
 	req := httptest.NewRequest(http.MethodGet, "http://oidc-proxy:8080/oauth2/sign_in?rd=/dashboard", nil)
@@ -419,3 +408,41 @@ func TestRefreshPageReadsCookieDirectly(t *testing.T) {
 	}
 }
 
+// TestCachedVerifyFromHandler exercises the cache wrapper through /verify:
+// repeated requests with the same id_token must hit the inner verifier
+// exactly once.
+func TestCachedVerifyFromHandler(t *testing.T) {
+	s := newTestServer(t)
+	var calls int32
+	inner := func(_ context.Context, tok string) (*token.Verified, error) {
+		atomic.AddInt32(&calls, 1)
+		if tok != "valid" {
+			return nil, errors.New("bad")
+		}
+		return &token.Verified{Subject: "alice", Email: "alice@example.com", Expiry: time.Now().Add(time.Hour)}, nil
+	}
+	s.verifyFn = cache.Wrap(inner, cache.New(8))
+
+	for i := 0; i < 4; i++ {
+		req := newAuthedRequest(s, "valid")
+		w := recordVerify(s, req)
+		if w.Code != 200 {
+			t.Fatalf("iteration %d: status = %d", i, w.Code)
+		}
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("inner verifier called %d times across 4 /verify requests, want 1", got)
+	}
+}
+
+func TestSanitizeRedirect_smokeViaSignIn(t *testing.T) {
+	// Cross-package sanitization is covered by utils tests; here we just
+	// confirm a non-same-origin rd is dropped at the handler boundary.
+	s := newTestServer(t)
+	req := httptest.NewRequest(http.MethodGet, "http://oidc-proxy:8080/oauth2/sign_in?rd=https://evil.test/x", nil)
+	w := httptest.NewRecorder()
+	s.handleSignIn(w, req)
+	if strings.Contains(w.Body.String(), "evil.test") {
+		t.Fatalf("evil redirect was not sanitized")
+	}
+}
