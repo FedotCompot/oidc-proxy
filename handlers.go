@@ -77,8 +77,8 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 	s.renderHTML(w, startTemplate, flowData{
 		ClientID:          s.cfg.ClientID,
 		Scopes:            s.cfg.Scopes,
-		AuthorizeEndpoint: s.endpoints.AuthURL,
-		TokenEndpoint:     s.endpoints.TokenURL,
+		AuthorizeEndpoint: s.provider.Endpoint().AuthURL,
+		TokenEndpoint:     s.provider.Endpoint().TokenURL,
 		CookiePrefix:      s.cfg.CookiePrefix,
 		Redirect:          rd,
 	})
@@ -92,8 +92,8 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 	s.renderHTML(w, callbackTemplate, flowData{
 		ClientID:          s.cfg.ClientID,
 		Scopes:            s.cfg.Scopes,
-		AuthorizeEndpoint: s.endpoints.AuthURL,
-		TokenEndpoint:     s.endpoints.TokenURL,
+		AuthorizeEndpoint: s.provider.Endpoint().AuthURL,
+		TokenEndpoint:     s.provider.Endpoint().TokenURL,
 		CookiePrefix:      s.cfg.CookiePrefix,
 	})
 }
@@ -110,8 +110,8 @@ func (s *Server) handleRefresh(w http.ResponseWriter, r *http.Request) {
 	s.renderHTML(w, refreshTemplate, flowData{
 		ClientID:          s.cfg.ClientID,
 		Scopes:            s.cfg.Scopes,
-		AuthorizeEndpoint: s.endpoints.AuthURL,
-		TokenEndpoint:     s.endpoints.TokenURL,
+		AuthorizeEndpoint: s.provider.Endpoint().AuthURL,
+		TokenEndpoint:     s.provider.Endpoint().TokenURL,
 		CookiePrefix:      s.cfg.CookiePrefix,
 		Redirect:          rd,
 	})
@@ -193,7 +193,7 @@ func (s *Server) renderHTML(w http.ResponseWriter, t *template.Template, data an
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Frame-Options", "DENY")
 	connect := "'self'"
-	if o := originOf(s.endpoints.TokenURL); o != "" {
+	if o := originOf(s.provider.Endpoint().TokenURL); o != "" {
 		connect += " " + o
 	}
 	w.Header().Set("Content-Security-Policy", "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src "+connect)

@@ -5,11 +5,39 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/coreos/go-oidc/v3/oidc"
 )
+
+// fakeProvider stands up a minimal OIDC discovery server that publishes the
+// supplied authorize/token endpoints, then returns an *oidc.Provider built
+// against it. Test cleanup tears the server down.
+func fakeProvider(t *testing.T, authURL, tokenURL string) *oidc.Provider {
+	t.Helper()
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/.well-known/openid-configuration":
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"issuer":%q,"authorization_endpoint":%q,"token_endpoint":%q,"jwks_uri":"%s/jwks"}`,
+				srv.URL, authURL, tokenURL, srv.URL)
+		case "/jwks":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"keys":[]}`))
+		}
+	}))
+	t.Cleanup(srv.Close)
+	p, err := oidc.NewProvider(context.Background(), srv.URL)
+	if err != nil {
+		t.Fatalf("oidc.NewProvider: %v", err)
+	}
+	return p
+}
 
 func newTestServer(t *testing.T) *Server {
 	t.Helper()
@@ -21,6 +49,7 @@ func newTestServer(t *testing.T) *Server {
 			SignInButton: "Sign in with SSO",
 			Scopes:       "openid profile email",
 		},
+		provider: fakeProvider(t, "https://issuer.example.com/authorize", "https://issuer.example.com/token"),
 		verifyFn: func(_ context.Context, tok string) (*VerifiedToken, error) {
 			if tok == "valid" {
 				return &VerifiedToken{Subject: "stub-sub", Nonce: "stub-nonce"}, nil
@@ -346,8 +375,6 @@ func TestSignInRendersHTML(t *testing.T) {
 
 func TestStartRendersJSPage(t *testing.T) {
 	s := newTestServer(t)
-	s.endpoints.AuthURL = "https://issuer.example.com/authorize"
-	s.endpoints.TokenURL = "https://issuer.example.com/token"
 	req := httptest.NewRequest(http.MethodGet, "http://oidc-proxy:8080/oauth2/start?rd=/page", nil)
 	w := httptest.NewRecorder()
 
@@ -372,7 +399,6 @@ func TestStartRendersJSPage(t *testing.T) {
 
 func TestRefreshPageReadsCookieDirectly(t *testing.T) {
 	s := newTestServer(t)
-	s.endpoints.TokenURL = "https://issuer.example.com/token"
 	req := httptest.NewRequest(http.MethodGet, "http://oidc-proxy:8080/oauth2/refresh?rd=/page", nil)
 	w := httptest.NewRecorder()
 

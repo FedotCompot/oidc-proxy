@@ -11,7 +11,6 @@ import (
 
 	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/kelseyhightower/envconfig"
-	"golang.org/x/oauth2"
 )
 
 type Config struct {
@@ -59,10 +58,9 @@ func wrapVerifier(v *oidc.IDTokenVerifier) func(context.Context, string) (*Verif
 }
 
 type Server struct {
-	cfg       Config
-	provider  *oidc.Provider
-	verifyFn  func(ctx context.Context, token string) (*VerifiedToken, error)
-	endpoints oauth2.Endpoint
+	cfg      Config
+	provider *oidc.Provider
+	verifyFn func(ctx context.Context, token string) (*VerifiedToken, error)
 }
 
 func loadConfig() (Config, error) {
@@ -100,10 +98,9 @@ func main() {
 	verifier := provider.Verifier(&oidc.Config{ClientID: cfg.ClientID})
 	cache := newTokenCache(cfg.VerifyCacheSize)
 	s := &Server{
-		cfg:       cfg,
-		provider:  provider,
-		verifyFn:  withCache(wrapVerifier(verifier), cache),
-		endpoints: provider.Endpoint(),
+		cfg:      cfg,
+		provider: provider,
+		verifyFn: withCache(wrapVerifier(verifier), cache),
 	}
 
 	mux := http.NewServeMux()
