@@ -181,7 +181,15 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// handleSignOut clears the token cookies. Cross-site requests are rejected so
+// a third party can't log the user out with `<img src=…/sign_out>`. We accept
+// same-origin/same-site/none (typed URL), and POST from anywhere — POST has
+// no <img>-style gadget.
 func (s *Server) handleSignOut(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost && r.Header.Get("Sec-Fetch-Site") == "cross-site" {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
 	s.clearTokens(w)
 	rd := utils.SanitizeRedirect(r.URL.Query().Get("rd"))
 	if rd == "" {

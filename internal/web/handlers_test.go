@@ -343,6 +343,35 @@ func TestSignOutClearsAllTokenCookies(t *testing.T) {
 	}
 }
 
+func TestSignOutRejectsCrossSiteGET(t *testing.T) {
+	s := newTestServer(t)
+	req := httptest.NewRequest(http.MethodGet, "http://oidc-proxy:8080/oauth2/sign_out", nil)
+	req.Header.Set("Sec-Fetch-Site", "cross-site")
+	w := httptest.NewRecorder()
+
+	s.handleSignOut(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", w.Code)
+	}
+	if len(w.Result().Cookies()) != 0 {
+		t.Fatalf("cross-site sign_out should not touch cookies, got %d", len(w.Result().Cookies()))
+	}
+}
+
+func TestSignOutAllowsSameOriginGET(t *testing.T) {
+	s := newTestServer(t)
+	req := httptest.NewRequest(http.MethodGet, "http://oidc-proxy:8080/oauth2/sign_out", nil)
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	w := httptest.NewRecorder()
+
+	s.handleSignOut(w, req)
+
+	if w.Code != http.StatusFound {
+		t.Fatalf("status = %d, want 302", w.Code)
+	}
+}
+
 func TestSignInRendersHTML(t *testing.T) {
 	s := newTestServer(t)
 	req := httptest.NewRequest(http.MethodGet, "http://oidc-proxy:8080/oauth2/sign_in?rd=/dashboard", nil)
