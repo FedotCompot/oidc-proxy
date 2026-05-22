@@ -128,9 +128,7 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 
 	var body struct {
 		IDToken      string `json:"id_token"`
-		AccessToken  string `json:"access_token"`
 		RefreshToken string `json:"refresh_token"`
-		ExpiresIn    int64  `json:"expires_in"`
 		Nonce        string `json:"nonce"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&body); err != nil {
@@ -173,16 +171,9 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	expiry := time.Time{}
-	if body.ExpiresIn > 0 {
-		expiry = time.Now().Add(time.Duration(body.ExpiresIn) * time.Second)
-	}
-
 	sess := &Session{
-		AccessToken:  body.AccessToken,
 		IDToken:      body.IDToken,
 		RefreshToken: body.RefreshToken,
-		Expiry:       expiry,
 		Email:        claims.Email,
 		Subject:      idTok.Subject,
 	}

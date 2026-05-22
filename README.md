@@ -14,7 +14,9 @@ server-side token redemption when a redirect URI is registered as SPA.
 
 - Public-client / PKCE flow — no client secret needed
 - Browser does the token exchange; backend only verifies & seals cookies
-- AES-GCM encrypted HttpOnly session cookie holding access / ID / refresh tokens
+- AES-GCM encrypted HttpOnly session cookie holding ID + refresh tokens
+  (split across `<prefix>_session_0`, `<prefix>_session_1`, … to stay under
+  the 4KB per-cookie browser limit)
 - Self-contained HTML sign-in screen + tiny JS pages (no external assets)
 - Zero config files — everything is env vars
 - Two required env vars: `OIDC_ISSUER`, `OIDC_CLIENT_ID`
@@ -151,13 +153,26 @@ middleware's `authResponseHeaders` (shown in the example above).
 
 ### Microsoft Entra ID
 
-Register the redirect URI under the **Single-Page Application** platform.
-Because the token exchange happens in the browser via `fetch()`, the
-browser automatically sets the `Origin` header — the cross-origin signal
-Entra requires for SPA-registered apps (avoids `AADSTS9002327`).
+1. **Register the redirect URI under the *Single-Page Application*
+   platform.** Because the token exchange happens in the browser via
+   `fetch()`, the browser automatically sets the `Origin` header — the
+   cross-origin signal Entra requires for SPA-registered apps (avoids
+   `AADSTS9002327`).
 
-Make sure refresh-token issuance is enabled for SPAs in your app
-registration if you want token refresh.
+2. **Override `OIDC_SCOPES`:**
+
+   ```
+   OIDC_SCOPES="openid profile email offline_access User.Read"
+   ```
+
+   With only `openid profile email`, Entra has no resource to issue an
+   access token against, would issue one with audience = the app itself,
+   and refuses with `AADSTS90009` ("Application is requesting a token
+   for itself"). `User.Read` gives the access token a real audience
+   (Microsoft Graph). `offline_access` enables refresh tokens.
+
+3. Grant admin consent for `User.Read` (or have the user consent on
+   first sign-in).
 
 ### Google / Auth0 / Okta / Keycloak
 
@@ -165,8 +180,11 @@ Standard SPA / public-client registration with PKCE. No special setup.
 
 ## Security model
 
-- Tokens are stored only in an **HttpOnly, AES-GCM-encrypted cookie**.
-  JS in the static site has no access to them.
+- The ID token and refresh token are stored in an **HttpOnly,
+  AES-GCM-encrypted cookie** (chunked across `<prefix>_session_N` cookies
+  so each stays under the 4KB browser per-cookie limit). The access
+  token isn't stored — nothing on the backend reads it, and oidc-proxy
+  doesn't proxy requests upstream.
 - The refresh token is briefly readable by the JS on
   `/oauth2/refresh` (and only there). CORS and `SameSite=Lax` prevent
   cross-origin reads.

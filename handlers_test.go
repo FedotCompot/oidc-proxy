@@ -62,10 +62,9 @@ func TestVerifyRedirectsWhenNoSession(t *testing.T) {
 func TestVerifyAllowsValidSession(t *testing.T) {
 	s := newTestServer(t)
 	sess := &Session{
-		AccessToken: "at",
-		IDToken:     "valid",
-		Email:       "alice@example.com",
-		Subject:     "alice-sub",
+		IDToken: "valid",
+		Email:   "alice@example.com",
+		Subject: "alice-sub",
 	}
 	token, err := s.sealJSON(sess)
 	if err != nil {
@@ -73,7 +72,7 @@ func TestVerifyAllowsValidSession(t *testing.T) {
 	}
 
 	req := httptest.NewRequest(http.MethodGet, "http://oidc-proxy:8080/verify", nil)
-	req.AddCookie(&http.Cookie{Name: s.sessionCookieName(), Value: token})
+	req.AddCookie(&http.Cookie{Name: s.sessionCookieName() + "_0", Value: token})
 	w := httptest.NewRecorder()
 
 	s.handleVerify(w, req)
@@ -101,7 +100,7 @@ func TestVerifyRedirectsToRefreshOnInvalidIDToken(t *testing.T) {
 	req.Header.Set("X-Forwarded-Proto", "https")
 	req.Header.Set("X-Forwarded-Host", "app.example.com")
 	req.Header.Set("X-Forwarded-Uri", "/some/page")
-	req.AddCookie(&http.Cookie{Name: s.sessionCookieName(), Value: token})
+	req.AddCookie(&http.Cookie{Name: s.sessionCookieName() + "_0", Value: token})
 	w := httptest.NewRecorder()
 
 	s.handleVerify(w, req)
@@ -122,7 +121,7 @@ func TestVerifyRedirectsToSignInWhenNoRefreshToken(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "http://oidc-proxy:8080/verify", nil)
 	req.Header.Set("X-Forwarded-Proto", "https")
 	req.Header.Set("X-Forwarded-Host", "app.example.com")
-	req.AddCookie(&http.Cookie{Name: s.sessionCookieName(), Value: token})
+	req.AddCookie(&http.Cookie{Name: s.sessionCookieName() + "_0", Value: token})
 	w := httptest.NewRecorder()
 
 	s.handleVerify(w, req)
@@ -145,7 +144,7 @@ func TestVerifyDeniesDisallowedEmail(t *testing.T) {
 	token, _ := s.sealJSON(sess)
 
 	req := httptest.NewRequest(http.MethodGet, "http://oidc-proxy:8080/verify", nil)
-	req.AddCookie(&http.Cookie{Name: s.sessionCookieName(), Value: token})
+	req.AddCookie(&http.Cookie{Name: s.sessionCookieName() + "_0", Value: token})
 	w := httptest.NewRecorder()
 
 	s.handleVerify(w, req)
@@ -176,9 +175,7 @@ func TestSessionEndpointVerifiesAndSealsCookie(t *testing.T) {
 	s := newTestServer(t)
 	body, _ := json.Marshal(map[string]any{
 		"id_token":      "valid",
-		"access_token":  "at",
 		"refresh_token": "rt",
-		"expires_in":    3600,
 		"nonce":         "stub-nonce",
 	})
 	req := httptest.NewRequest(http.MethodPost, "http://oidc-proxy:8080/oauth2/session", bytes.NewReader(body))
@@ -193,22 +190,19 @@ func TestSessionEndpointVerifiesAndSealsCookie(t *testing.T) {
 	if w.Code != http.StatusNoContent {
 		t.Fatalf("status = %d, want 204 (body=%s)", w.Code, w.Body.String())
 	}
-	// The response sets a session cookie; round-trip through our seal/open.
-	var setCookie *http.Cookie
+	// Round-trip the Set-Cookie chunks back through readSession.
+	next := httptest.NewRequest(http.MethodGet, "http://oidc-proxy:8080/verify", nil)
 	for _, c := range w.Result().Cookies() {
-		if c.Name == s.sessionCookieName() {
-			setCookie = c
-			break
+		if c.MaxAge == -1 {
+			continue // skip cleanup-cookies for higher chunk indices
 		}
+		next.AddCookie(&http.Cookie{Name: c.Name, Value: c.Value})
 	}
-	if setCookie == nil {
-		t.Fatalf("session cookie not set")
+	sess, err := s.readSession(next)
+	if err != nil {
+		t.Fatalf("readSession: %v", err)
 	}
-	var sess Session
-	if err := s.openJSON(setCookie.Value, &sess); err != nil {
-		t.Fatalf("could not open sealed cookie: %v", err)
-	}
-	if sess.IDToken != "valid" || sess.AccessToken != "at" || sess.RefreshToken != "rt" || sess.Subject != "stub-sub" {
+	if sess.IDToken != "valid" || sess.RefreshToken != "rt" || sess.Subject != "stub-sub" {
 		t.Fatalf("unexpected session contents: %+v", sess)
 	}
 }
@@ -256,7 +250,7 @@ func TestRefreshTokenEndpointReturnsToken(t *testing.T) {
 	req.Header.Set("Origin", "https://app.example.com")
 	req.Header.Set("X-Forwarded-Proto", "https")
 	req.Header.Set("X-Forwarded-Host", "app.example.com")
-	req.AddCookie(&http.Cookie{Name: s.sessionCookieName(), Value: tok})
+	req.AddCookie(&http.Cookie{Name: s.sessionCookieName() + "_0", Value: tok})
 	w := httptest.NewRecorder()
 
 	s.handleRefreshToken(w, req)
@@ -309,6 +303,47 @@ func TestSignInRendersHTML(t *testing.T) {
 	body := w.Body.String()
 	if !strings.Contains(body, `href="/oauth2/start?rd=%2Fdashboard"`) {
 		t.Fatalf("body missing start link with rd: %s", body)
+	}
+}
+
+func TestSessionCookieChunksAndRoundTrips(t *testing.T) {
+	s := newTestServer(t)
+	// ~6KB ID token + ~1.5KB refresh token: forces multi-cookie split.
+	sess := &Session{
+		IDToken:      strings.Repeat("X", 6000),
+		RefreshToken: strings.Repeat("Y", 1500),
+		Email:        "alice@example.com",
+		Subject:      "alice-sub",
+	}
+
+	w := httptest.NewRecorder()
+	if err := s.writeSession(w, sess); err != nil {
+		t.Fatalf("writeSession: %v", err)
+	}
+
+	var chunks int
+	next := httptest.NewRequest(http.MethodGet, "http://oidc-proxy:8080/verify", nil)
+	for _, c := range w.Result().Cookies() {
+		if c.MaxAge == -1 {
+			continue
+		}
+		if len(c.Value) > 4000 {
+			t.Errorf("chunk %q is %d bytes — exceeds per-cookie limit", c.Name, len(c.Value))
+		}
+		chunks++
+		next.AddCookie(&http.Cookie{Name: c.Name, Value: c.Value})
+	}
+	if chunks < 2 {
+		t.Fatalf("expected >=2 chunks for an oversized payload, got %d", chunks)
+	}
+
+	got, err := s.readSession(next)
+	if err != nil {
+		t.Fatalf("readSession: %v", err)
+	}
+	if got.IDToken != sess.IDToken || got.RefreshToken != sess.RefreshToken ||
+		got.Email != sess.Email || got.Subject != sess.Subject {
+		t.Fatalf("round-trip mismatch")
 	}
 }
 
