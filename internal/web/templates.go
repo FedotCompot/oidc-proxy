@@ -47,11 +47,6 @@ const sharedStyles = `<style>
     font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
     background: #f6f7f9; color: #1a1a1a; padding: 24px;
   }
-  @media (prefers-color-scheme: dark) {
-    body { background: #15161a; color: #e6e6e6; }
-    .card { background: #1f2127; border-color: #2c2f37; }
-    .subtitle, .muted { color: #9aa0aa; }
-  }
   .card {
     background: #fff; border: 1px solid #e3e5ea; border-radius: 14px;
     padding: 36px 40px; width: min(380px, 100%);
@@ -84,6 +79,11 @@ const sharedStyles = `<style>
     animation: oidc-spin 0.8s linear infinite;
   }
   @keyframes oidc-spin { to { transform: rotate(360deg); } }
+  @media (prefers-color-scheme: dark) {
+    body { background: #15161a; color: #e6e6e6; }
+    .card { background: #1f2127; border-color: #2c2f37; }
+    .subtitle, .muted { color: #9aa0aa; }
+  }
 </style>`
 
 var signInTemplate = template.Must(template.New("signin").Parse(`<!doctype html>
