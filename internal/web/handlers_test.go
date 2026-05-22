@@ -30,7 +30,7 @@ func fakeProvider(t *testing.T, authURL, tokenURL string) *oidc.Provider {
 		switch r.URL.Path {
 		case "/.well-known/openid-configuration":
 			w.Header().Set("Content-Type", "application/json")
-			fmt.Fprintf(w, `{"issuer":%q,"authorization_endpoint":%q,"token_endpoint":%q,"jwks_uri":"%s/jwks"}`,
+			_, _ = fmt.Fprintf(w, `{"issuer":%q,"authorization_endpoint":%q,"token_endpoint":%q,"jwks_uri":"%s/jwks"}`,
 				srv.URL, authURL, tokenURL, srv.URL)
 		case "/jwks":
 			w.Header().Set("Content-Type", "application/json")
