@@ -435,6 +435,44 @@ func TestCachedVerifyFromHandler(t *testing.T) {
 	}
 }
 
+// TestFlowPagesDoNotUseInnerHTML pins the shared fail() helper against the
+// XSS gadget it used to expose: writing attacker-controlled strings into
+// document.body.innerHTML. The fail() helper is reused by start / callback /
+// refresh, so a single check covers all three.
+func TestFlowPagesDoNotUseInnerHTML(t *testing.T) {
+	s := newTestServer(t)
+	for _, path := range []string{"/oauth2/start", "/oauth2/callback", "/oauth2/refresh"} {
+		req := httptest.NewRequest(http.MethodGet, "http://oidc-proxy:8080"+path, nil)
+		w := httptest.NewRecorder()
+		s.Routes().ServeHTTP(w, req)
+		body := w.Body.String()
+		if strings.Contains(body, ".innerHTML") {
+			t.Errorf("%s renders with .innerHTML; use textContent / DOM construction to avoid XSS", path)
+		}
+	}
+}
+
+// TestCallbackDoesNotRenderErrorDescription asserts the callback page no
+// longer threads the OAuth `error_description` URL param into a thrown Error
+// (which used to surface in the rendered DOM via fail()). Attacker payload:
+//
+//	/oauth2/callback?error=x&error_description=<img src=x onerror=alert(1)>
+func TestCallbackDoesNotRenderErrorDescription(t *testing.T) {
+	s := newTestServer(t)
+	req := httptest.NewRequest(http.MethodGet, "http://oidc-proxy:8080/oauth2/callback", nil)
+	w := httptest.NewRecorder()
+	s.handleCallback(w, req)
+	body := w.Body.String()
+	// error_description should only be referenced in a console.error call,
+	// never concatenated into a thrown Error or rendered string.
+	if strings.Contains(body, "error_description') || ''") {
+		t.Errorf("callback still concatenates error_description into a user-visible string")
+	}
+	if !strings.Contains(body, "console.error('oidc-proxy authorization error:'") {
+		t.Errorf("callback should route OAuth error details to console.error only")
+	}
+}
+
 func TestSanitizeRedirect_smokeViaSignIn(t *testing.T) {
 	// Cross-package sanitization is covered by utils tests; here we just
 	// confirm a non-same-origin rd is dropped at the handler boundary.

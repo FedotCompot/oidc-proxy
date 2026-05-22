@@ -83,9 +83,24 @@ async function sha256b64(s) {
   return b64url(new Uint8Array(hash));
 }
 function fail(msg, detail) {
-  document.body.innerHTML = '<main class="card"><h1>Authentication error</h1><p>' +
-    (msg || '') + '</p><pre style="white-space:pre-wrap;font-size:12px;color:#999">' +
-    (detail || '') + '</pre><p><a href="/oauth2/sign_in">Try again</a></p></main>';
+  if (detail) console.error('oidc-proxy:', detail);
+  const main = document.createElement('main');
+  main.className = 'card';
+  const h1 = document.createElement('h1');
+  h1.textContent = 'Authentication error';
+  const p = document.createElement('p');
+  p.textContent = msg || 'Sign-in failed.';
+  const hint = document.createElement('p');
+  hint.style.color = '#999';
+  hint.style.fontSize = '12px';
+  hint.textContent = 'See the browser console for details.';
+  const retryWrap = document.createElement('p');
+  const retry = document.createElement('a');
+  retry.href = '/oauth2/sign_in';
+  retry.textContent = 'Try again';
+  retryWrap.appendChild(retry);
+  main.replaceChildren(h1, p, hint, retryWrap);
+  document.body.replaceChildren(main);
 }
 async function postSession(tokens) {
   const r = await fetch('/oauth2/session', {
@@ -174,7 +189,10 @@ var callbackTemplate = template.Must(template.New("callback").Parse(flowPageHead
     const tokenEndpoint = {{.TokenEndpoint}};
     const params = new URLSearchParams(window.location.search);
     const err = params.get('error');
-    if (err) throw new Error(err + ': ' + (params.get('error_description') || ''));
+    if (err) {
+      console.error('oidc-proxy authorization error:', err, params.get('error_description'));
+      throw new Error('authorization error');
+    }
     const code = params.get('code');
     const state = params.get('state');
     if (!code) throw new Error('missing authorization code');
