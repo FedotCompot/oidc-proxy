@@ -153,7 +153,7 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	idTok, err := s.verifyFn(ctx, body.IDToken)
 	if err != nil {
-		log.Printf("id_token verify failed: %v", err)
+		log.Print("id_token verify failed")
 		http.Error(w, "id_token invalid", http.StatusUnauthorized)
 		return
 	}
