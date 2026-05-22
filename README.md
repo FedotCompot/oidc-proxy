@@ -134,7 +134,9 @@ the destination URL across the redirects.
 | `ALLOWED_EMAILS` | no | — | Comma-separated allowlist of emails |
 | `ALLOWED_DOMAINS` | no | — | Comma-separated allowlist of email domains |
 | `SIGN_IN_TITLE` | no | `Sign in` | Sign-in page heading |
+| `SIGN_IN_SUBTITLE` | no | — | Optional smaller text under the heading (e.g. `Use your work account`) |
 | `SIGN_IN_BUTTON` | no | `Sign in with SSO` | Button label |
+| `BRAND_COLOR` | no | `#2563eb` | Accent color for the button, focus ring, icon tint, and spinner. CSS hex only (`#rgb`, `#rrggbb`, or with alpha); invalid values fall back to the default |
 | `LISTEN_ADDR` | no | `:8080` | HTTP listen address |
 
 If both `ALLOWED_EMAILS` and `ALLOWED_DOMAINS` are unset, any user the

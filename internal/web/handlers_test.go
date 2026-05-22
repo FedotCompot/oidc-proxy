@@ -54,6 +54,7 @@ func newTestServer(t *testing.T) *Server {
 			SignInTitle:  "Sign in",
 			SignInButton: "Sign in with SSO",
 			Scopes:       "openid profile email",
+			BrandColor:   "#2563eb",
 		},
 		provider: fakeProvider(t, "https://issuer.example.com/authorize", "https://issuer.example.com/token"),
 		verifyFn: func(_ context.Context, tok string) (*token.Verified, error) {
@@ -445,6 +446,50 @@ func TestSignInRendersHTML(t *testing.T) {
 	body := w.Body.String()
 	if !strings.Contains(body, `href="/oauth2/start?rd=%2Fdashboard"`) {
 		t.Fatalf("body missing start link with rd: %s", body)
+	}
+}
+
+// TestSignInUsesBrandColorAndSubtitle pins that the BRAND_COLOR and
+// SIGN_IN_SUBTITLE config knobs actually reach the rendered HTML — the
+// brand color drives the --accent CSS custom property and the subtitle
+// only appears when set.
+func TestSignInUsesBrandColorAndSubtitle(t *testing.T) {
+	s := newTestServer(t)
+	s.cfg.BrandColor = "#ff6600"
+	s.cfg.SignInSubtitle = "Welcome to Acme"
+	req := httptest.NewRequest(http.MethodGet, "http://oidc-proxy:8080/oauth2/sign_in", nil)
+	w := httptest.NewRecorder()
+
+	s.handleSignIn(w, req)
+
+	body := w.Body.String()
+	if !strings.Contains(body, "--accent: #ff6600") {
+		t.Errorf("body missing brand color in CSS:\n%s", body)
+	}
+	if !strings.Contains(body, "Welcome to Acme") {
+		t.Errorf("body missing subtitle: %s", body)
+	}
+
+	// Subtitle is opt-in — without it, no .subtitle paragraph.
+	s.cfg.SignInSubtitle = ""
+	w = httptest.NewRecorder()
+	s.handleSignIn(w, req)
+	if strings.Contains(w.Body.String(), `class="subtitle"`) {
+		t.Errorf("subtitle paragraph rendered when SignInSubtitle is empty")
+	}
+}
+
+// TestFlowPagesShowSpinner pins the spinner element appears on the
+// transitional pages so users see motion while the OIDC dance happens.
+func TestFlowPagesShowSpinner(t *testing.T) {
+	s := newTestServer(t)
+	for _, path := range []string{"/oauth2/start", "/oauth2/callback", "/oauth2/refresh"} {
+		req := httptest.NewRequest(http.MethodGet, "http://oidc-proxy:8080"+path, nil)
+		w := httptest.NewRecorder()
+		s.Routes().ServeHTTP(w, req)
+		if !strings.Contains(w.Body.String(), `class="spinner"`) {
+			t.Errorf("%s missing spinner", path)
+		}
 	}
 }
 

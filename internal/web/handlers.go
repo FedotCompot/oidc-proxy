@@ -64,9 +64,11 @@ func (s *Server) handleSignIn(w http.ResponseWriter, r *http.Request) {
 		startURL += "?rd=" + url.QueryEscape(rd)
 	}
 	s.renderHTML(w, signInTemplate, &signInData{
-		Title:    s.cfg.SignInTitle,
-		Button:   s.cfg.SignInButton,
-		StartURL: startURL,
+		Title:      s.cfg.SignInTitle,
+		Subtitle:   s.cfg.SignInSubtitle,
+		Button:     s.cfg.SignInButton,
+		StartURL:   startURL,
+		BrandColor: s.cfg.BrandColor,
 	})
 }
 
@@ -84,6 +86,7 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 		AuthorizeEndpoint: s.provider.Endpoint().AuthURL,
 		TokenEndpoint:     s.provider.Endpoint().TokenURL,
 		CookiePrefix:      s.cfg.CookiePrefix,
+		BrandColor:        s.cfg.BrandColor,
 		Redirect:          rd,
 	})
 }
@@ -99,6 +102,7 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 		AuthorizeEndpoint: s.provider.Endpoint().AuthURL,
 		TokenEndpoint:     s.provider.Endpoint().TokenURL,
 		CookiePrefix:      s.cfg.CookiePrefix,
+		BrandColor:        s.cfg.BrandColor,
 	})
 }
 
@@ -117,6 +121,7 @@ func (s *Server) handleRefresh(w http.ResponseWriter, r *http.Request) {
 		AuthorizeEndpoint: s.provider.Endpoint().AuthURL,
 		TokenEndpoint:     s.provider.Endpoint().TokenURL,
 		CookiePrefix:      s.cfg.CookiePrefix,
+		BrandColor:        s.cfg.BrandColor,
 		Redirect:          rd,
 	})
 }
