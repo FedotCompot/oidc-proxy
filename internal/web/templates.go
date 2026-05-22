@@ -2,11 +2,21 @@ package web
 
 import "html/template"
 
+// htmlPage is the contract every page-data struct satisfies so renderHTML
+// can stamp a freshly-generated CSP nonce onto it. Each struct embeds it
+// via a Nonce field and a setNonce method.
+type htmlPage interface {
+	setNonce(string)
+}
+
 type signInData struct {
 	Title    string
 	Button   string
 	StartURL string
+	Nonce    string
 }
+
+func (d *signInData) setNonce(n string) { d.Nonce = n }
 
 // flowData is passed to the JS pages (start / callback / refresh). The fields
 // are interpolated into the page's inline <script> via html/template, which
@@ -18,7 +28,10 @@ type flowData struct {
 	TokenEndpoint     string
 	CookiePrefix      string
 	Redirect          string // not used by callback (it reads sessionStorage)
+	Nonce             string
 }
+
+func (d *flowData) setNonce(n string) { d.Nonce = n }
 
 var signInTemplate = template.Must(template.New("signin").Parse(`<!doctype html>
 <html lang="en">
@@ -145,7 +158,7 @@ const flowPageHead = `<!doctype html>
 <main class="card"><h1>Signing in…</h1><p>One moment.</p></main>
 `
 
-var startTemplate = template.Must(template.New("start").Parse(flowPageHead + `<script>
+var startTemplate = template.Must(template.New("start").Parse(flowPageHead + `<script nonce="{{.Nonce}}">
 ` + pkceJS + `
 (async () => {
   try {
@@ -181,7 +194,7 @@ var startTemplate = template.Must(template.New("start").Parse(flowPageHead + `<s
 </body></html>
 `))
 
-var callbackTemplate = template.Must(template.New("callback").Parse(flowPageHead + `<script>
+var callbackTemplate = template.Must(template.New("callback").Parse(flowPageHead + `<script nonce="{{.Nonce}}">
 ` + pkceJS + `
 (async () => {
   try {
@@ -226,7 +239,7 @@ var callbackTemplate = template.Must(template.New("callback").Parse(flowPageHead
 </body></html>
 `))
 
-var refreshTemplate = template.Must(template.New("refresh").Parse(flowPageHead + `<script>
+var refreshTemplate = template.Must(template.New("refresh").Parse(flowPageHead + `<script nonce="{{.Nonce}}">
 ` + pkceJS + `
 function readCookie(name) {
   for (const part of document.cookie.split(';')) {

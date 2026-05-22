@@ -2,6 +2,8 @@ package web
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"html/template"
 	"log"
@@ -61,7 +63,7 @@ func (s *Server) handleSignIn(w http.ResponseWriter, r *http.Request) {
 	if rd != "" {
 		startURL += "?rd=" + url.QueryEscape(rd)
 	}
-	s.renderHTML(w, signInTemplate, signInData{
+	s.renderHTML(w, signInTemplate, &signInData{
 		Title:    s.cfg.SignInTitle,
 		Button:   s.cfg.SignInButton,
 		StartURL: startURL,
@@ -76,7 +78,7 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 	if rd == "" {
 		rd = "/"
 	}
-	s.renderHTML(w, startTemplate, flowData{
+	s.renderHTML(w, startTemplate, &flowData{
 		ClientID:          s.cfg.ClientID,
 		Scopes:            s.cfg.Scopes,
 		AuthorizeEndpoint: s.provider.Endpoint().AuthURL,
@@ -91,7 +93,7 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 // via fetch() (the browser sets `Origin`, satisfying Entra's SPA check), and
 // POSTs the tokens to /oauth2/session for verification + cookie write.
 func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
-	s.renderHTML(w, callbackTemplate, flowData{
+	s.renderHTML(w, callbackTemplate, &flowData{
 		ClientID:          s.cfg.ClientID,
 		Scopes:            s.cfg.Scopes,
 		AuthorizeEndpoint: s.provider.Endpoint().AuthURL,
@@ -109,7 +111,7 @@ func (s *Server) handleRefresh(w http.ResponseWriter, r *http.Request) {
 	if rd == "" {
 		rd = "/"
 	}
-	s.renderHTML(w, refreshTemplate, flowData{
+	s.renderHTML(w, refreshTemplate, &flowData{
 		ClientID:          s.cfg.ClientID,
 		Scopes:            s.cfg.Scopes,
 		AuthorizeEndpoint: s.provider.Endpoint().AuthURL,
@@ -198,7 +200,9 @@ func (s *Server) handleSignOut(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, rd, http.StatusFound)
 }
 
-func (s *Server) renderHTML(w http.ResponseWriter, t *template.Template, data any) {
+func (s *Server) renderHTML(w http.ResponseWriter, t *template.Template, data htmlPage) {
+	nonce := newCSPNonce()
+	data.setNonce(nonce)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Frame-Options", "DENY")
@@ -206,10 +210,20 @@ func (s *Server) renderHTML(w http.ResponseWriter, t *template.Template, data an
 	if o := utils.OriginOf(s.provider.Endpoint().TokenURL); o != "" {
 		connect += " " + o
 	}
-	w.Header().Set("Content-Security-Policy", "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src "+connect)
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; script-src 'nonce-"+nonce+"'; style-src 'unsafe-inline'; connect-src "+connect)
 	if err := t.Execute(w, data); err != nil {
 		log.Printf("template render: %v", err)
 	}
+}
+
+// newCSPNonce returns 128 bits of entropy as a URL-safe base64 string, fresh
+// per response. The script-src nonce binds the page's CSP to the inline
+// <script> we emit, so any attacker-injected <script> without the matching
+// nonce won't execute.
+func newCSPNonce() string {
+	var b [16]byte
+	_, _ = rand.Read(b[:])
+	return base64.RawURLEncoding.EncodeToString(b[:])
 }
 
 // sameOrigin guards /oauth2/session against session-fixation: only accept

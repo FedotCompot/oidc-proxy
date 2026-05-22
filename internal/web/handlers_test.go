@@ -343,6 +343,63 @@ func TestSignOutClearsAllTokenCookies(t *testing.T) {
 	}
 }
 
+// TestCSPNonceMatchesScript checks the inline <script> tag carries the same
+// nonce the CSP header advertises, and that the policy no longer relies on
+// 'unsafe-inline'. Without the nonce in the script tag, the browser would
+// refuse to run the page; without the policy switch, an injected <script>
+// would run too.
+func TestCSPNonceMatchesScript(t *testing.T) {
+	s := newTestServer(t)
+	for _, path := range []string{"/oauth2/start", "/oauth2/callback", "/oauth2/refresh"} {
+		req := httptest.NewRequest(http.MethodGet, "http://oidc-proxy:8080"+path, nil)
+		w := httptest.NewRecorder()
+		s.Routes().ServeHTTP(w, req)
+
+		csp := w.Header().Get("Content-Security-Policy")
+		if strings.Contains(csp, "'unsafe-inline'") && strings.Contains(csp, "script-src 'unsafe-inline'") {
+			t.Errorf("%s: script-src still uses 'unsafe-inline': %s", path, csp)
+		}
+		// Pull the nonce out of the CSP header.
+		const marker = "script-src 'nonce-"
+		idx := strings.Index(csp, marker)
+		if idx < 0 {
+			t.Fatalf("%s: CSP missing script-src nonce: %s", path, csp)
+		}
+		end := strings.IndexByte(csp[idx+len(marker):], '\'')
+		if end < 0 {
+			t.Fatalf("%s: unterminated nonce in CSP: %s", path, csp)
+		}
+		nonce := csp[idx+len(marker) : idx+len(marker)+end]
+		if nonce == "" {
+			t.Fatalf("%s: empty nonce", path)
+		}
+		want := `<script nonce="` + nonce + `">`
+		if !strings.Contains(w.Body.String(), want) {
+			t.Errorf("%s: body missing matching %s", path, want)
+		}
+	}
+}
+
+// TestCSPNonceIsFreshPerResponse pins that two consecutive renders pick
+// different nonces — a static nonce would defeat the defense.
+func TestCSPNonceIsFreshPerResponse(t *testing.T) {
+	s := newTestServer(t)
+	nonces := map[string]bool{}
+	for range 3 {
+		req := httptest.NewRequest(http.MethodGet, "http://oidc-proxy:8080/oauth2/start", nil)
+		w := httptest.NewRecorder()
+		s.handleStart(w, req)
+		csp := w.Header().Get("Content-Security-Policy")
+		const marker = "script-src 'nonce-"
+		idx := strings.Index(csp, marker)
+		end := strings.IndexByte(csp[idx+len(marker):], '\'')
+		nonces[csp[idx+len(marker):idx+len(marker)+end]] = true
+	}
+	if len(nonces) < 3 {
+		t.Fatalf("expected 3 distinct nonces, got %d: %v", len(nonces), nonces)
+	}
+}
+
 func TestSignOutRejectsCrossSiteGET(t *testing.T) {
 	s := newTestServer(t)
 	req := httptest.NewRequest(http.MethodGet, "http://oidc-proxy:8080/oauth2/sign_out", nil)
