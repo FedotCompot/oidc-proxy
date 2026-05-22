@@ -2,26 +2,20 @@ package main
 
 import (
 	"context"
-	"errors"
-	"fmt"
+	"encoding/json"
 	"html/template"
 	"log"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
-
-	"github.com/coreos/go-oidc/v3/oidc"
-	"golang.org/x/oauth2"
 )
 
 // handleVerify is the Traefik ForwardAuth target.
 //
-// 200 → request is authenticated (Traefik allows it through)
-// 302 → not authenticated; browser is redirected to /oauth2/sign_in
-//
-// Traefik sends the original request info via X-Forwarded-* headers; we use
-// those to remember where the user was trying to go.
+// 200 → cookie carries a valid ID token (signature + iss/aud/exp check pass)
+// 302 → no/expired cookie; redirected to sign_in or refresh
+// 403 → authenticated but email not in the allowlist
 func (s *Server) handleVerify(w http.ResponseWriter, r *http.Request) {
 	sess, err := s.readSession(r)
 	if err != nil {
@@ -29,11 +23,14 @@ func (s *Server) handleVerify(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !sess.Expiry.IsZero() && time.Now().After(sess.Expiry) {
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	if _, err := s.verifyFn(ctx, sess.IDToken); err != nil {
 		if sess.RefreshToken != "" {
 			s.redirectToRefresh(w, r)
 			return
 		}
+		s.clearSession(w)
 		s.redirectToSignIn(w, r)
 		return
 	}
@@ -53,174 +50,168 @@ func (s *Server) handleVerify(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-// handleSignIn renders a minimal HTML login screen. The "Sign in" button just
-// links to /oauth2/start, which kicks off the OIDC redirect dance.
+// handleSignIn is the minimal HTML login screen. Single button → /oauth2/start.
 func (s *Server) handleSignIn(w http.ResponseWriter, r *http.Request) {
 	rd := sanitizeRedirect(r.URL.Query().Get("rd"))
 	startURL := "/oauth2/start"
 	if rd != "" {
 		startURL += "?rd=" + url.QueryEscape(rd)
 	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-store")
-	_ = signInTemplate.Execute(w, signInData{
+	s.renderHTML(w, signInTemplate, signInData{
 		Title:    s.cfg.SignInTitle,
 		Button:   s.cfg.SignInButton,
-		StartURL: template.URL(startURL),
+		StartURL: startURL,
 	})
 }
 
-// handleStart generates PKCE + state + nonce, stashes them in an encrypted
-// flow cookie, and 302s the browser to the issuer's authorize endpoint.
+// handleStart serves a tiny HTML+JS page that generates a PKCE verifier,
+// state, and nonce in the browser, stashes them in sessionStorage, then
+// redirects to the provider's authorize endpoint. Nothing is exchanged here.
 func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 	rd := sanitizeRedirect(r.URL.Query().Get("rd"))
 	if rd == "" {
 		rd = "/"
 	}
-
-	verifier := oauth2.GenerateVerifier()
-	state, err := randURLSafe(24)
-	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
-	nonce, err := randURLSafe(24)
-	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
-
-	redirectURI := s.callbackURL(r)
-	flow := &flowState{
-		State:        state,
-		CodeVerifier: verifier,
-		Nonce:        nonce,
-		Redirect:     rd,
-		RedirectURI:  redirectURI,
-	}
-	if err := s.writeFlow(w, flow); err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
-
-	cfg := s.oauth2Config(redirectURI)
-	authURL := cfg.AuthCodeURL(state,
-		oidc.Nonce(nonce),
-		oauth2.S256ChallengeOption(verifier),
-		oauth2.AccessTypeOffline,
-	)
-	http.Redirect(w, r, authURL, http.StatusFound)
+	s.renderHTML(w, startTemplate, flowData{
+		ClientID:          s.cfg.ClientID,
+		Scopes:            strings.Join(s.cfg.Scopes, " "),
+		AuthorizeEndpoint: s.endpoints.AuthURL,
+		TokenEndpoint:     s.endpoints.TokenURL,
+		Redirect:          rd,
+	})
 }
 
-// handleCallback receives the redirect from the issuer, validates state, swaps
-// the code for tokens (PKCE), verifies the ID token, and persists a session.
+// handleCallback serves a tiny HTML+JS page that finishes the OIDC flow in
+// the browser: it reads the code from the URL, calls the token endpoint via
+// fetch() (so the browser sets the `Origin` header — required by Entra SPA),
+// and POSTs the tokens to /oauth2/session for verification + cookie sealing.
 func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
-	flow, err := s.readFlow(r)
-	if err != nil {
-		http.Error(w, "missing or invalid flow cookie", http.StatusBadRequest)
-		return
-	}
-	s.clearFlow(w)
-
-	if errParam := r.URL.Query().Get("error"); errParam != "" {
-		desc := r.URL.Query().Get("error_description")
-		http.Error(w, fmt.Sprintf("oidc error: %s: %s", errParam, desc), http.StatusBadRequest)
-		return
-	}
-
-	if r.URL.Query().Get("state") != flow.State {
-		http.Error(w, "state mismatch", http.StatusBadRequest)
-		return
-	}
-
-	code := r.URL.Query().Get("code")
-	if code == "" {
-		http.Error(w, "missing code", http.StatusBadRequest)
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-	defer cancel()
-
-	cfg := s.oauth2Config(flow.RedirectURI)
-	tok, err := cfg.Exchange(ctx, code, oauth2.VerifierOption(flow.CodeVerifier))
-	if err != nil {
-		log.Printf("token exchange failed: %v", err)
-		http.Error(w, "token exchange failed", http.StatusBadGateway)
-		return
-	}
-
-	sess, err := s.sessionFromToken(ctx, tok, flow.Nonce)
-	if err != nil {
-		log.Printf("session build failed: %v", err)
-		http.Error(w, err.Error(), http.StatusUnauthorized)
-		return
-	}
-
-	if !s.userAllowed(sess.Email) {
-		http.Error(w, "forbidden", http.StatusForbidden)
-		return
-	}
-
-	if err := s.writeSession(w, sess); err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
-	http.Redirect(w, r, flow.Redirect, http.StatusFound)
+	s.renderHTML(w, callbackTemplate, flowData{
+		ClientID:          s.cfg.ClientID,
+		Scopes:            strings.Join(s.cfg.Scopes, " "),
+		AuthorizeEndpoint: s.endpoints.AuthURL,
+		TokenEndpoint:     s.endpoints.TokenURL,
+	})
 }
 
-// handleRefresh uses the refresh token in the existing session cookie to mint
-// a new access/ID token, rewrites the session cookie, and bounces the user
-// back to the original URL. Reached as a direct browser request (not via
-// forward-auth), so Set-Cookie works without extra Traefik configuration.
+// handleRefresh serves a tiny HTML+JS page that fetches the refresh token
+// from the backend, calls the token endpoint in the browser, and POSTs the
+// new tokens back to /oauth2/session.
 func (s *Server) handleRefresh(w http.ResponseWriter, r *http.Request) {
 	rd := sanitizeRedirect(r.URL.Query().Get("rd"))
 	if rd == "" {
 		rd = "/"
 	}
+	s.renderHTML(w, refreshTemplate, flowData{
+		ClientID:          s.cfg.ClientID,
+		Scopes:            strings.Join(s.cfg.Scopes, " "),
+		AuthorizeEndpoint: s.endpoints.AuthURL,
+		TokenEndpoint:     s.endpoints.TokenURL,
+		Redirect:          rd,
+	})
+}
 
-	sess, err := s.readSession(r)
-	if err != nil || sess.RefreshToken == "" {
-		s.redirectToSignInWith(w, r, rd)
+// handleSession receives the tokens the browser obtained from the provider,
+// verifies the ID token, and seals an encrypted HttpOnly cookie. This is the
+// only place the backend touches the tokens, and it never makes outbound
+// calls to the provider's token endpoint — only inbound JWKS lookups (cached
+// by go-oidc) during ID token verification.
+func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.sameOrigin(r) {
+		http.Error(w, "bad origin", http.StatusForbidden)
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	var body struct {
+		IDToken      string `json:"id_token"`
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+		ExpiresIn    int64  `json:"expires_in"`
+		Nonce        string `json:"nonce"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&body); err != nil {
+		http.Error(w, "invalid body", http.StatusBadRequest)
+		return
+	}
+	if body.IDToken == "" {
+		http.Error(w, "missing id_token", http.StatusBadRequest)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
-
-	cfg := s.oauth2Config(s.callbackURL(r))
-	src := cfg.TokenSource(ctx, &oauth2.Token{RefreshToken: sess.RefreshToken})
-	tok, err := src.Token()
+	idTok, err := s.verifyFn(ctx, body.IDToken)
 	if err != nil {
-		log.Printf("refresh failed: %v", err)
-		s.clearSession(w)
-		s.redirectToSignInWith(w, r, rd)
+		log.Printf("id_token verify failed: %v", err)
+		http.Error(w, "id_token invalid", http.StatusUnauthorized)
+		return
+	}
+	if body.Nonce != "" && idTok.Nonce != body.Nonce {
+		http.Error(w, "nonce mismatch", http.StatusUnauthorized)
 		return
 	}
 
-	newSess, err := s.sessionFromToken(ctx, tok, "")
-	if err != nil {
-		log.Printf("session rebuild failed: %v", err)
-		s.clearSession(w)
-		s.redirectToSignInWith(w, r, rd)
-		return
+	var claims struct {
+		Email string `json:"email"`
 	}
-	// Some IdPs don't return a new refresh token on refresh — keep the old one.
-	if newSess.RefreshToken == "" {
-		newSess.RefreshToken = sess.RefreshToken
-	}
+	_ = idTok.Claims(&claims)
 
-	if !s.userAllowed(newSess.Email) {
-		s.clearSession(w)
+	if !s.userAllowed(claims.Email) {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
 
-	if err := s.writeSession(w, newSess); err != nil {
+	// Preserve a refresh token from a prior session if the new response omits
+	// one (some IdPs only return refresh_token on the initial exchange).
+	if body.RefreshToken == "" {
+		if prev, err := s.readSession(r); err == nil {
+			body.RefreshToken = prev.RefreshToken
+		}
+	}
+
+	expiry := time.Time{}
+	if body.ExpiresIn > 0 {
+		expiry = time.Now().Add(time.Duration(body.ExpiresIn) * time.Second)
+	}
+
+	sess := &Session{
+		AccessToken:  body.AccessToken,
+		IDToken:      body.IDToken,
+		RefreshToken: body.RefreshToken,
+		Expiry:       expiry,
+		Email:        claims.Email,
+		Subject:      idTok.Subject,
+	}
+	if err := s.writeSession(w, sess); err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	http.Redirect(w, r, rd, http.StatusFound)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleRefreshToken hands the refresh token back to the browser so the
+// /oauth2/refresh page can call the provider's token endpoint itself.
+// Same-origin only; the response is JSON and CORS blocks cross-origin reads.
+func (s *Server) handleRefreshToken(w http.ResponseWriter, r *http.Request) {
+	if !s.sameOrigin(r) {
+		http.Error(w, "bad origin", http.StatusForbidden)
+		return
+	}
+	sess, err := s.readSession(r)
+	if err != nil || sess.RefreshToken == "" {
+		http.Error(w, "no refresh token", http.StatusUnauthorized)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	_ = json.NewEncoder(w).Encode(map[string]string{
+		"refresh_token": sess.RefreshToken,
+		"client_id":     s.cfg.ClientID,
+	})
 }
 
 func (s *Server) handleSignOut(w http.ResponseWriter, r *http.Request) {
@@ -232,52 +223,41 @@ func (s *Server) handleSignOut(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, rd, http.StatusFound)
 }
 
-// sessionFromToken extracts the ID token, verifies it, and folds the claims
-// plus refresh token into a Session.
-func (s *Server) sessionFromToken(ctx context.Context, tok *oauth2.Token, expectedNonce string) (*Session, error) {
-	rawID, ok := tok.Extra("id_token").(string)
-	if !ok || rawID == "" {
-		return nil, errors.New("id_token missing from token response")
+func (s *Server) renderHTML(w http.ResponseWriter, t *template.Template, data any) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Frame-Options", "DENY")
+	connect := "'self'"
+	if o := originOf(s.endpoints.TokenURL); o != "" {
+		connect += " " + o
 	}
-	idTok, err := s.verifier.Verify(ctx, rawID)
-	if err != nil {
-		return nil, fmt.Errorf("id_token verify: %w", err)
-	}
-	if expectedNonce != "" && idTok.Nonce != expectedNonce {
-		return nil, errors.New("nonce mismatch")
-	}
-
-	var claims struct {
-		Email         string `json:"email"`
-		EmailVerified bool   `json:"email_verified"`
-	}
-	_ = idTok.Claims(&claims)
-
-	return &Session{
-		AccessToken:  tok.AccessToken,
-		IDToken:      rawID,
-		RefreshToken: tok.RefreshToken,
-		Expiry:       tok.Expiry,
-		Email:        claims.Email,
-		Subject:      idTok.Subject,
-	}, nil
-}
-
-func (s *Server) oauth2Config(redirectURI string) *oauth2.Config {
-	return &oauth2.Config{
-		ClientID:    s.cfg.ClientID,
-		Endpoint:    s.endpoints,
-		RedirectURL: redirectURI,
-		Scopes:      s.cfg.Scopes,
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src "+connect)
+	if err := t.Execute(w, data); err != nil {
+		log.Printf("template render: %v", err)
 	}
 }
 
-// callbackURL builds the redirect URI from the current request. For
-// forward-auth verify calls this comes from X-Forwarded-*; for direct hits
-// (the user is at /oauth2/...) it comes from the actual request.
-func (s *Server) callbackURL(r *http.Request) string {
-	proto, host := forwardedProto(r), forwardedHost(r)
-	return proto + "://" + host + "/oauth2/callback"
+// sameOrigin guards same-origin-only endpoints (POST /oauth2/session and GET
+// /oauth2/refresh_token). It rejects requests whose Origin header doesn't
+// match the forwarded host.
+func (s *Server) sameOrigin(r *http.Request) bool {
+	got := r.Header.Get("Origin")
+	if got == "" {
+		// Some browsers omit Origin on same-origin GET; accept Referer fallback
+		// only when no Origin is set at all (POST always has Origin set).
+		if r.Method == http.MethodGet {
+			if ref := r.Header.Get("Referer"); ref != "" {
+				return originOf(ref) == s.expectedOrigin(r)
+			}
+			return true
+		}
+		return false
+	}
+	return got == s.expectedOrigin(r)
+}
+
+func (s *Server) expectedOrigin(r *http.Request) string {
+	return forwardedProto(r) + "://" + forwardedHost(r)
 }
 
 func (s *Server) redirectToSignIn(w http.ResponseWriter, r *http.Request) {
@@ -285,8 +265,7 @@ func (s *Server) redirectToSignIn(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) redirectToSignInWith(w http.ResponseWriter, r *http.Request, rd string) {
-	proto, host := forwardedProto(r), forwardedHost(r)
-	u := proto + "://" + host + "/oauth2/sign_in"
+	u := s.expectedOrigin(r) + "/oauth2/sign_in"
 	if rd != "" {
 		u += "?rd=" + url.QueryEscape(rd)
 	}
@@ -294,8 +273,7 @@ func (s *Server) redirectToSignInWith(w http.ResponseWriter, r *http.Request, rd
 }
 
 func (s *Server) redirectToRefresh(w http.ResponseWriter, r *http.Request) {
-	proto, host := forwardedProto(r), forwardedHost(r)
-	u := proto + "://" + host + "/oauth2/refresh?rd=" + url.QueryEscape(originalURL(r))
+	u := s.expectedOrigin(r) + "/oauth2/refresh?rd=" + url.QueryEscape(originalURL(r))
 	http.Redirect(w, r, u, http.StatusFound)
 }
 
@@ -334,7 +312,7 @@ func forwardedHost(r *http.Request) string {
 	return r.Host
 }
 
-// originalURL reconstructs the URL the user was originally trying to reach,
+// originalURL reconstructs the URL the user was originally trying to reach
 // using Traefik's X-Forwarded-* headers (Uri carries path+query).
 func originalURL(r *http.Request) string {
 	uri := r.Header.Get("X-Forwarded-Uri")
@@ -347,8 +325,7 @@ func originalURL(r *http.Request) string {
 	return forwardedProto(r) + "://" + forwardedHost(r) + uri
 }
 
-// sanitizeRedirect blocks open-redirects: only allow same-origin paths or
-// fully-qualified URLs whose host matches the forwarded host.
+// sanitizeRedirect blocks open-redirects: only same-origin paths are allowed.
 func sanitizeRedirect(raw string) string {
 	if raw == "" {
 		return ""
@@ -356,7 +333,6 @@ func sanitizeRedirect(raw string) string {
 	if strings.HasPrefix(raw, "/") && !strings.HasPrefix(raw, "//") {
 		return raw
 	}
-	// Anything else gets dropped; we'll fall back to "/" upstream.
 	return ""
 }
 
@@ -366,3 +342,12 @@ func firstField(s string) string {
 	}
 	return strings.TrimSpace(s)
 }
+
+func originOf(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return ""
+	}
+	return u.Scheme + "://" + u.Host
+}
+

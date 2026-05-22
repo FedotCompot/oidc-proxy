@@ -35,7 +35,7 @@ type Config struct {
 type Server struct {
 	cfg       Config
 	provider  *oidc.Provider
-	verifier  *oidc.IDTokenVerifier
+	verifyFn  func(ctx context.Context, token string) (*oidc.IDToken, error)
 	endpoints oauth2.Endpoint
 }
 
@@ -153,10 +153,11 @@ func main() {
 		log.Fatalf("oidc discovery (%s): %v", cfg.Issuer, err)
 	}
 
+	verifier := provider.Verifier(&oidc.Config{ClientID: cfg.ClientID})
 	s := &Server{
 		cfg:       cfg,
 		provider:  provider,
-		verifier:  provider.Verifier(&oidc.Config{ClientID: cfg.ClientID}),
+		verifyFn:  verifier.Verify,
 		endpoints: provider.Endpoint(),
 	}
 
@@ -166,6 +167,8 @@ func main() {
 	mux.HandleFunc("/oauth2/start", s.handleStart)
 	mux.HandleFunc("/oauth2/callback", s.handleCallback)
 	mux.HandleFunc("/oauth2/refresh", s.handleRefresh)
+	mux.HandleFunc("/oauth2/session", s.handleSession)
+	mux.HandleFunc("/oauth2/refresh_token", s.handleRefreshToken)
 	mux.HandleFunc("/oauth2/sign_out", s.handleSignOut)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(204) })
 

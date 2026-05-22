@@ -21,22 +21,9 @@ type Session struct {
 	Subject      string    `json:"s,omitempty"`
 }
 
-// flowState is the short-lived payload stored during the OIDC redirect dance.
-type flowState struct {
-	State        string `json:"s"`
-	CodeVerifier string `json:"v"`
-	Nonce        string `json:"n"`
-	Redirect     string `json:"r"`
-	RedirectURI  string `json:"u"`
-}
-
-const (
-	sessionCookieSuffix = "_session"
-	flowCookieSuffix    = "_flow"
-)
+const sessionCookieSuffix = "_session"
 
 func (s *Server) sessionCookieName() string { return s.cfg.CookiePrefix + sessionCookieSuffix }
-func (s *Server) flowCookieName() string    { return s.cfg.CookiePrefix + flowCookieSuffix }
 
 func (s *Server) sealJSON(v any) (string, error) {
 	raw, err := json.Marshal(v)
@@ -111,32 +98,6 @@ func (s *Server) clearSession(w http.ResponseWriter) {
 	http.SetCookie(w, s.makeCookie(s.sessionCookieName(), "", time.Unix(0, 0), "/"))
 }
 
-func (s *Server) writeFlow(w http.ResponseWriter, f *flowState) error {
-	token, err := s.sealJSON(f)
-	if err != nil {
-		return err
-	}
-	exp := time.Now().Add(10 * time.Minute)
-	http.SetCookie(w, s.makeCookie(s.flowCookieName(), token, exp, "/oauth2"))
-	return nil
-}
-
-func (s *Server) readFlow(r *http.Request) (*flowState, error) {
-	c, err := r.Cookie(s.flowCookieName())
-	if err != nil {
-		return nil, err
-	}
-	var f flowState
-	if err := s.openJSON(c.Value, &f); err != nil {
-		return nil, err
-	}
-	return &f, nil
-}
-
-func (s *Server) clearFlow(w http.ResponseWriter) {
-	http.SetCookie(w, s.makeCookie(s.flowCookieName(), "", time.Unix(0, 0), "/oauth2"))
-}
-
 func (s *Server) makeCookie(name, value string, expires time.Time, path string) *http.Cookie {
 	c := &http.Cookie{
 		Name:     name,
@@ -152,13 +113,5 @@ func (s *Server) makeCookie(name, value string, expires time.Time, path string) 
 		c.MaxAge = -1
 	}
 	return c
-}
-
-func randURLSafe(n int) (string, error) {
-	b := make([]byte, n)
-	if _, err := rand.Read(b); err != nil {
-		return "", err
-	}
-	return base64.RawURLEncoding.EncodeToString(b), nil
 }
 

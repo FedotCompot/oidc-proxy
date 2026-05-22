@@ -5,7 +5,18 @@ import "html/template"
 type signInData struct {
 	Title    string
 	Button   string
-	StartURL template.URL
+	StartURL string
+}
+
+// flowData is passed to the JS pages (start / callback / refresh). The fields
+// are interpolated into the page's inline <script> via html/template, which
+// applies JS-context-aware escaping automatically.
+type flowData struct {
+	ClientID          string
+	Scopes            string
+	AuthorizeEndpoint string
+	TokenEndpoint     string
+	Redirect          string // not used by callback (it reads sessionStorage)
 }
 
 var signInTemplate = template.Must(template.New("signin").Parse(`<!doctype html>
@@ -51,4 +62,175 @@ var signInTemplate = template.Must(template.New("signin").Parse(`<!doctype html>
 </main>
 </body>
 </html>
+`))
+
+// pkceJS is the shared helper code embedded in start / callback / refresh.
+const pkceJS = `
+function b64url(bytes) {
+  let s = '';
+  for (const b of bytes) s += String.fromCharCode(b);
+  return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+function randURLSafe(n) {
+  const arr = new Uint8Array(n);
+  crypto.getRandomValues(arr);
+  return b64url(arr);
+}
+async function sha256b64(s) {
+  const bytes = new TextEncoder().encode(s);
+  const hash = await crypto.subtle.digest('SHA-256', bytes);
+  return b64url(new Uint8Array(hash));
+}
+function fail(msg, detail) {
+  document.body.innerHTML = '<main class="card"><h1>Authentication error</h1><p>' +
+    (msg || '') + '</p><pre style="white-space:pre-wrap;font-size:12px;color:#999">' +
+    (detail || '') + '</pre><p><a href="/oauth2/sign_in">Try again</a></p></main>';
+}
+async function postSession(tokens) {
+  const r = await fetch('/oauth2/session', {
+    method: 'POST',
+    credentials: 'same-origin',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(tokens),
+  });
+  if (!r.ok) throw new Error('session: ' + r.status + ' ' + await r.text());
+}
+async function tokenRequest(endpoint, params) {
+  const r = await fetch(endpoint, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+    body: new URLSearchParams(params),
+  });
+  if (!r.ok) throw new Error('token endpoint: ' + r.status + ' ' + await r.text());
+  return r.json();
+}
+`
+
+const flowPageHead = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Signing in…</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { margin: 0; min-height: 100vh; display: grid; place-items: center;
+         font: 15px/1.5 system-ui, -apple-system, sans-serif;
+         background: #f6f7f9; color: #1a1a1a; }
+  @media (prefers-color-scheme: dark) { body { background: #15161a; color: #e6e6e6; } .card { background: #1f2127; } }
+  .card { background: #fff; border-radius: 12px; padding: 32px 36px;
+          width: min(420px, 92vw); text-align: center; }
+  h1 { font-size: 18px; margin: 0 0 8px; font-weight: 600; }
+  p { color: #666; margin: 4px 0; }
+</style>
+</head>
+<body>
+<main class="card"><h1>Signing in…</h1><p>One moment.</p></main>
+`
+
+var startTemplate = template.Must(template.New("start").Parse(flowPageHead + `<script>
+` + pkceJS + `
+(async () => {
+  try {
+    const clientId = {{.ClientID}};
+    const scopes = {{.Scopes}};
+    const authorizeEndpoint = {{.AuthorizeEndpoint}};
+    const rd = {{.Redirect}};
+    const redirectUri = window.location.origin + '/oauth2/callback';
+    const verifier = randURLSafe(32);
+    const state = randURLSafe(24);
+    const nonce = randURLSafe(24);
+    const challenge = await sha256b64(verifier);
+    sessionStorage.setItem('oidc.verifier', verifier);
+    sessionStorage.setItem('oidc.state', state);
+    sessionStorage.setItem('oidc.nonce', nonce);
+    sessionStorage.setItem('oidc.rd', rd);
+    sessionStorage.setItem('oidc.redirect_uri', redirectUri);
+    const u = new URL(authorizeEndpoint);
+    u.searchParams.set('client_id', clientId);
+    u.searchParams.set('response_type', 'code');
+    u.searchParams.set('redirect_uri', redirectUri);
+    u.searchParams.set('scope', scopes);
+    u.searchParams.set('state', state);
+    u.searchParams.set('nonce', nonce);
+    u.searchParams.set('code_challenge', challenge);
+    u.searchParams.set('code_challenge_method', 'S256');
+    window.location = u.toString();
+  } catch (e) {
+    fail('Could not start the OIDC flow.', e.message);
+  }
+})();
+</script>
+</body></html>
+`))
+
+var callbackTemplate = template.Must(template.New("callback").Parse(flowPageHead + `<script>
+` + pkceJS + `
+(async () => {
+  try {
+    const clientId = {{.ClientID}};
+    const tokenEndpoint = {{.TokenEndpoint}};
+    const params = new URLSearchParams(window.location.search);
+    const err = params.get('error');
+    if (err) throw new Error(err + ': ' + (params.get('error_description') || ''));
+    const code = params.get('code');
+    const state = params.get('state');
+    if (!code) throw new Error('missing authorization code');
+    if (state !== sessionStorage.getItem('oidc.state')) throw new Error('state mismatch');
+    const verifier = sessionStorage.getItem('oidc.verifier');
+    const nonce = sessionStorage.getItem('oidc.nonce');
+    const rd = sessionStorage.getItem('oidc.rd') || '/';
+    const redirectUri = sessionStorage.getItem('oidc.redirect_uri') || (window.location.origin + '/oauth2/callback');
+    if (!verifier) throw new Error('missing PKCE verifier (sessionStorage cleared?)');
+
+    const tok = await tokenRequest(tokenEndpoint, {
+      grant_type: 'authorization_code',
+      client_id: clientId,
+      code,
+      redirect_uri: redirectUri,
+      code_verifier: verifier,
+    });
+    await postSession({ ...tok, nonce });
+
+    sessionStorage.removeItem('oidc.verifier');
+    sessionStorage.removeItem('oidc.state');
+    sessionStorage.removeItem('oidc.nonce');
+    sessionStorage.removeItem('oidc.rd');
+    sessionStorage.removeItem('oidc.redirect_uri');
+    window.location = rd;
+  } catch (e) {
+    fail('Sign-in failed.', e.message);
+  }
+})();
+</script>
+</body></html>
+`))
+
+var refreshTemplate = template.Must(template.New("refresh").Parse(flowPageHead + `<script>
+` + pkceJS + `
+(async () => {
+  const rd = {{.Redirect}};
+  const tokenEndpoint = {{.TokenEndpoint}};
+  function bailToSignIn() {
+    window.location = '/oauth2/sign_in?rd=' + encodeURIComponent(rd);
+  }
+  try {
+    const r = await fetch('/oauth2/refresh_token', { credentials: 'same-origin' });
+    if (!r.ok) return bailToSignIn();
+    const { refresh_token, client_id } = await r.json();
+    if (!refresh_token) return bailToSignIn();
+    const tok = await tokenRequest(tokenEndpoint, {
+      grant_type: 'refresh_token',
+      client_id,
+      refresh_token,
+    });
+    await postSession(tok);
+    window.location = rd;
+  } catch (e) {
+    bailToSignIn();
+  }
+})();
+</script>
+</body></html>
 `))
