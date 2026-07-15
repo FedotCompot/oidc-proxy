@@ -181,6 +181,123 @@ middleware's `authResponseHeaders` (shown in the example above).
 
 Standard SPA / public-client registration with PKCE. No special setup.
 
+## MCP authorization
+
+`oidc-proxy` can additionally act as an **MCP-compliant OAuth 2.1
+Authorization Server** (MCP spec rev 2025-06-18) in front of a remote HTTP
+MCP server, so AI-agent clients (Claude Code, Cursor, VS Code, `mcp-remote`,
+…) authenticate with the **same Microsoft Entra ID SSO** your human users
+already use — per-user identity, no shared secrets, zero client config.
+
+It is **off by default** (`MCP_ENABLED=false`) and leaves the human `/verify`
+cookie flow completely untouched. When enabled, the proxy:
+
+- issues **its own** short-lived, audience-bound JWT access tokens signed with
+  a stable ES256 key — it never redeems codes with Entra and never forwards
+  Entra tokens upstream (**no token passthrough**);
+- authenticates the browser at `/oauth2/authorize` purely by checking for a
+  valid Entra session cookie (reusing the existing sign-in / refresh pages);
+- is **stateless** — every artifact (client_id, consent blob, code, access &
+  refresh token) is a self-contained JWS/JWE, so it scales to multiple
+  replicas with no shared store.
+
+### Flow
+
+```
+  MCP client                     oidc-proxy (AS + RS)                 Entra ID
+      │  GET /mcp (no token)             │                                │
+      │─────────────────────────────────►│ /mcp-verify → 401              │
+      │  401 WWW-Authenticate:            │  resource_metadata=…           │
+      │◄─────────────────────────────────│                                │
+      │  GET /.well-known/oauth-protected-resource/<path>  (PRM, RFC 9728) │
+      │  GET /.well-known/oauth-authorization-server       (AS md, 8414)   │
+      │  POST /oauth2/register            │  (DCR, RFC 7591 → client_id)   │
+      │─────────────────────────────────►│                                │
+      │  GET /oauth2/authorize (browser, PKCE S256 + resource)             │
+      │─────────────────────────────────►│  no Entra cookie? ───► SSO ────►│
+      │                                   │  consent page (Approve)        │
+      │  POST /oauth2/authorize (same-origin, CSRF-guarded) → code         │
+      │  POST /oauth2/token (code + PKCE verifier) → access + refresh      │
+      │◄─────────────────────────────────│                                │
+      │  GET /mcp  Authorization: Bearer <access token>                    │
+      │─────────────────────────────────►│ /mcp-verify → 200 + headers     │
+```
+
+`/mcp-verify` is a second `forwardAuth` target (analogous to `/verify`, but
+for bearer tokens instead of cookies): it validates the token signature
+(ES256, alg-pinned), `token_use=access`, `iss`, audience (`aud == MCP_RESOURCE`),
+and expiry, then emits `X-Auth-Request-Email` / `X-Auth-Request-User`. It never
+redirects — only `200` / `401` / `403`.
+
+### MCP endpoints (only registered when `MCP_ENABLED=true`)
+
+| Path | Method | Purpose |
+| --- | --- | --- |
+| `/.well-known/oauth-authorization-server` | GET | AS metadata (RFC 8414) |
+| `/.well-known/openid-configuration` | GET | Same, plus OIDC-probe fields |
+| `/.well-known/oauth-protected-resource[/<path>]` | GET | Protected-resource metadata (RFC 9728) |
+| `/oauth2/jwks.json` | GET | Public ES256 signing key(s) |
+| `/oauth2/register` | POST | Dynamic Client Registration (RFC 7591) |
+| `/oauth2/authorize` | GET | Validate + authenticate + render consent |
+| `/oauth2/authorize` | POST | Same-origin, CSRF-guarded — mints the code |
+| `/oauth2/token` | POST | authorization_code + refresh_token grants |
+| `/mcp-verify` | GET/POST | Resource-server `forwardAuth` target |
+
+### MCP environment variables
+
+| Variable | Required | Default | Notes |
+| --- | --- | --- | --- |
+| `MCP_ENABLED` | no | `false` | Master switch for all of the above |
+| `MCP_ISSUER` | if enabled | — | Canonical AS issuer, absolute `https://` URL. **Static** — never derived from `X-Forwarded-*` |
+| `MCP_RESOURCE` | if enabled | — | Canonical MCP resource URI, e.g. `https://docs.example.com/mcp` |
+| `MCP_RESOURCE_DOCS` | no | — | Optional human docs URL advertised in PRM |
+| `MCP_SIGNING_KEY` / `MCP_SIGNING_KEY_FILE` | if enabled | — | ES256 private key (PEM) or a path to it. **Must be stable across replicas/restarts** |
+| `MCP_SIGNING_KID` | no | JWK thumbprint | `kid` for the signing key |
+| `MCP_ENC_KEY` | no | HKDF from signing key | 32-byte base64 key for the code/consent JWEs (A256GCM) |
+| `MCP_ACCESS_TOKEN_TTL` | no | `15m` | Access-token lifetime |
+| `MCP_REFRESH_TOKEN_TTL` | no | `8h` | Refresh lifetime — short on purpose (see below) |
+| `MCP_CODE_TTL` | no | `60s` | Authorization-code lifetime |
+| `MCP_AUTHREQ_TTL` | no | `5m` | Consent-request blob lifetime |
+| `MCP_SCOPES_SUPPORTED` | no | `mcp` | Advertised scopes (drives metadata + PRM) |
+
+`ALLOWED_EMAILS` / `ALLOWED_DOMAINS` gate MCP access too — enforced at both
+`/oauth2/authorize` and `/mcp-verify`.
+
+Generate a signing key with:
+
+```bash
+openssl ecparam -name prime256v1 -genkey -noout   # -> MCP_SIGNING_KEY (PEM)
+```
+
+### Traefik wiring
+
+The existing `PathPrefix(/oauth2)` route already covers `authorize` / `token`
+/ `register` / `jwks.json`. Two additions are needed (handled in your Traefik
+config, not this repo):
+
+1. A **public** route (no auth middleware) for the discovery paths:
+   `PathPrefix(/.well-known/oauth-protected-resource)`,
+   `PathPrefix(/.well-known/oauth-authorization-server)`,
+   `PathPrefix(/.well-known/openid-configuration)` → oidc-proxy.
+2. The `/mcp` route → your MCP server, gated by a **new** `forwardAuth`
+   middleware pointing at `http://oidc-proxy:8080/mcp-verify` with
+   `authResponseHeaders: X-Auth-Request-Email,X-Auth-Request-User`.
+
+Do not log `/oauth2` query strings (codes are opaque JWEs, but avoid it
+anyway). The MCP server itself stays vanilla — all enforcement is `/mcp-verify`.
+
+### Connecting a client
+
+```
+claude mcp add --transport http docs https://docs.example.com/mcp
+# → browser opens Microsoft SSO → consent → done (no manual token)
+```
+
+> **Refresh-token TTL is short on purpose.** Per-replica reuse detection is
+> best-effort (there is no shared store), so a leaked refresh token is
+> otherwise undetectable for its whole life. Raise `MCP_REFRESH_TOKEN_TTL`
+> only once a shared `ReplayGuard` (e.g. Redis) backs reuse detection.
+
 ## Security model
 
 - The ID, access, and refresh tokens are written to three separate
