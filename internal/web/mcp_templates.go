@@ -1,0 +1,152 @@
+package web
+
+import (
+	"html/template"
+	"log"
+	"net/http"
+)
+
+// consentData drives the MCP authorization consent screen. Everything on it is
+// either server-validated (RedirectHost, Resource, Scopes) or explicitly
+// labelled self-asserted (ClientName). AuthReq/CSRF are opaque hidden fields.
+type consentData struct {
+	RedirectHost string
+	ClientName   string
+	Resource     string
+	Scopes       []string
+	AuthReq      string
+	CSRF         string
+	BrandColor   string
+}
+
+// authzErrorData drives the HTML error pages returned before a validated
+// redirect_uri exists (bad client_id / redirect_uri / not-allowed).
+type authzErrorData struct {
+	Title      string
+	Message    string
+	BrandColor string
+}
+
+// renderConsent renders the approval page. Its CSP allows the inline styles and
+// a same-origin form POST (form-action 'self'), but no scripts and no other
+// destinations — the page is a pure HTML form.
+func (s *Server) renderConsent(w http.ResponseWriter, data *consentData) {
+	if data.BrandColor == "" {
+		data.BrandColor = s.cfg.BrandColor
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Frame-Options", "DENY")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	w.Header().Set("Content-Security-Policy",
+		"default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'")
+	if err := consentTemplate.Execute(w, data); err != nil {
+		log.Printf("mcp: consent render: %v", err)
+	}
+}
+
+// renderAuthzError renders an HTML error page (never a redirect) for the
+// pre-validation authorize failures.
+func (s *Server) renderAuthzError(w http.ResponseWriter, status int, title, message string) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Frame-Options", "DENY")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'")
+	w.WriteHeader(status)
+	if err := authzErrorTemplate.Execute(w, &authzErrorData{
+		Title:      title,
+		Message:    message,
+		BrandColor: s.cfg.BrandColor,
+	}); err != nil {
+		log.Printf("mcp: authz error render: %v", err)
+	}
+}
+
+// consentStyles adds a couple of consent-specific rules on top of sharedStyles.
+const consentStyles = `<style>
+  .card { text-align: left; width: min(440px, 100%); }
+  .consent-anchor {
+    font-size: 15px; margin: 0 0 20px; padding: 14px 16px;
+    background: color-mix(in srgb, var(--accent) 8%, transparent);
+    border: 1px solid color-mix(in srgb, var(--accent) 24%, transparent);
+    border-radius: 10px;
+  }
+  .consent-anchor strong { word-break: break-all; }
+  .consent-list { list-style: none; padding: 0; margin: 0 0 24px; }
+  .consent-list li { display: flex; justify-content: space-between; gap: 16px; padding: 8px 0; border-bottom: 1px solid #e3e5ea; font-size: 14px; }
+  .consent-list .k { color: #6b7280; }
+  .consent-list .v { text-align: right; word-break: break-all; font-weight: 500; }
+  .unverified { color: #9a6b00; font-size: 12px; }
+  .scopes { display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end; }
+  .scope { background: color-mix(in srgb, var(--accent) 12%, transparent); color: var(--accent); border-radius: 999px; padding: 2px 10px; font-size: 12px; font-weight: 500; }
+  .actions { display: flex; gap: 12px; margin-top: 8px; }
+  .actions .btn { width: auto; flex: 1; }
+  .btn.secondary { background: transparent; color: var(--accent); border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent); }
+  .btn.secondary:hover { filter: none; background: color-mix(in srgb, var(--accent) 8%, transparent); }
+  @media (prefers-color-scheme: dark) {
+    .consent-list li { border-color: #2c2f37; }
+    .unverified { color: #d9a441; }
+  }
+</style>`
+
+var consentTemplate = template.Must(template.New("consent").Parse(`<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Authorize access</title>
+` + sharedStyles + consentStyles + `
+</head>
+<body>
+<main class="card">
+  <span class="card-icon" aria-hidden="true">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M9 12l2 2 4-4"></path>
+      <path d="M12 3l7 3v6c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6z"></path>
+    </svg>
+  </span>
+  <h1>Authorize access</h1>
+  <p class="consent-anchor">You'll be returned to <strong>{{.RedirectHost}}</strong>. Only approve if you started this sign-in from an app you trust — this host is where your authorization will be delivered.</p>
+  <ul class="consent-list">
+    {{if .ClientName}}<li><span class="k">App name <span class="unverified">(unverified)</span></span><span class="v">{{.ClientName}}</span></li>{{end}}
+    <li><span class="k">Resource</span><span class="v">{{.Resource}}</span></li>
+    <li><span class="k">Scopes</span><span class="v"><span class="scopes">{{range .Scopes}}<span class="scope">{{.}}</span>{{end}}</span></span></li>
+  </ul>
+  <form method="post" action="/oauth2/authorize">
+    <input type="hidden" name="authreq" value="{{.AuthReq}}">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <div class="actions">
+      <button class="btn secondary" type="submit" name="action" value="deny">Deny</button>
+      <button class="btn" type="submit" name="action" value="approve">Approve</button>
+    </div>
+  </form>
+</main>
+</body>
+</html>
+`))
+
+var authzErrorTemplate = template.Must(template.New("authzerr").Parse(`<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>{{.Title}}</title>
+` + sharedStyles + `
+</head>
+<body>
+<main class="card">
+  <span class="card-icon" aria-hidden="true">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <circle cx="12" cy="12" r="10"></circle>
+      <path d="M12 8v4"></path>
+      <path d="M12 16h.01"></path>
+    </svg>
+  </span>
+  <h1>{{.Title}}</h1>
+  <p class="subtitle">{{.Message}}</p>
+</main>
+</body>
+</html>
+`))

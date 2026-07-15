@@ -2,6 +2,7 @@
 package utils
 
 import (
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -63,4 +64,19 @@ func OriginOf(rawURL string) string {
 		return ""
 	}
 	return u.Scheme + "://" + u.Host
+}
+
+// ClientIP returns a best-effort client identifier for rate limiting. Behind
+// Traefik the first X-Forwarded-For hop is the real client; otherwise fall
+// back to the connection's remote address (port stripped). This is used only
+// for coarse abuse limiting, never for authorization decisions.
+func ClientIP(r *http.Request) string {
+	if v := r.Header.Get("X-Forwarded-For"); v != "" {
+		return FirstField(v)
+	}
+	host := r.RemoteAddr
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		return h
+	}
+	return host
 }
