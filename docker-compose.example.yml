@@ -29,6 +29,20 @@ services:
       # Optional cosmetics:
       # SIGN_IN_TITLE: "Acme intranet"
       # SIGN_IN_BUTTON: "Sign in with Google"
+      #
+      # --- MCP OAuth 2.1 Authorization Server (off by default) --------------
+      # Turn oidc-proxy into an MCP auth gateway for AI-agent clients. See the
+      # "MCP authorization" section of the README. Generate the ES256 key with:
+      #   openssl ecparam -name prime256v1 -genkey -noout
+      # The key MUST be identical across replicas/restarts (mount a secret;
+      # never generate per pod).
+      # MCP_ENABLED: "true"
+      # MCP_ISSUER: https://app.example.com
+      # MCP_RESOURCE: https://app.example.com/mcp
+      # MCP_SIGNING_KEY_FILE: /run/secrets/mcp_signing_key
+      # MCP_ACCESS_TOKEN_TTL: 15m
+      # MCP_REFRESH_TOKEN_TTL: 8h
+      # ALLOWED_DOMAINS also gates MCP access.
     labels:
       - traefik.enable=true
       # The auth-middleware Traefik uses to gate the static site.
@@ -39,6 +53,15 @@ services:
       - traefik.http.routers.oidc-proxy.entrypoints=websecure
       - traefik.http.routers.oidc-proxy.tls=true
       - traefik.http.services.oidc-proxy.loadbalancer.server.port=8080
+      # --- MCP wiring (uncomment alongside MCP_ENABLED above) ---------------
+      # Public router for MCP discovery documents (no auth middleware):
+      # - traefik.http.routers.oidc-mcp-wellknown.rule=Host(`app.example.com`) && (PathPrefix(`/.well-known/oauth-protected-resource`) || PathPrefix(`/.well-known/oauth-authorization-server`) || PathPrefix(`/.well-known/openid-configuration`))
+      # - traefik.http.routers.oidc-mcp-wellknown.entrypoints=websecure
+      # - traefik.http.routers.oidc-mcp-wellknown.tls=true
+      # forwardAuth middleware for the MCP resource server (bearer tokens):
+      # - traefik.http.middlewares.mcp-auth.forwardauth.address=http://oidc-proxy:8080/mcp-verify
+      # - traefik.http.middlewares.mcp-auth.forwardauth.authResponseHeaders=X-Auth-Request-Email,X-Auth-Request-User
+      # Apply mcp-auth@docker to your /mcp router (points at the MCP server).
 
   site:
     image: nginx:alpine
