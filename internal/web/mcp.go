@@ -216,13 +216,14 @@ func (s *Server) handleAuthorizeGET(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.renderConsent(w, &consentData{
-		RedirectHost: hostOf(redirectURI),
-		ClientName:   client.ClientName,
-		Resource:     s.as.Resource,
-		Scopes:       splitScopes(scope, s.as.ScopesSupported),
-		AuthReq:      blob,
-		CSRF:         csrf,
-		BrandColor:   s.cfg.BrandColor,
+		RedirectHost:   hostOf(redirectURI),
+		RedirectOrigin: utils.OriginOf(redirectURI),
+		ClientName:     client.ClientName,
+		Resource:       s.as.Resource,
+		Scopes:         splitScopes(scope, s.as.ScopesSupported),
+		AuthReq:        blob,
+		CSRF:           csrf,
+		BrandColor:     s.cfg.BrandColor,
 	})
 }
 
