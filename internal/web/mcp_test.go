@@ -459,6 +459,27 @@ func postApprove(s *Server, authreq, csrf, action, origin, idToken string) *http
 	return w
 }
 
+// TestConsentReferrerPolicy guards a subtle browser regression: the consent
+// page's Approve button is a plain top-level <form> POST, and under a
+// Referrer-Policy of "no-referrer" a browser sends Origin: null on that POST,
+// which handleAuthorizePOST's sameOrigin check rejects as "bad origin". The
+// policy must be "same-origin" so the real Origin survives the same-origin POST.
+func TestConsentReferrerPolicy(t *testing.T) {
+	s := newMCPServer(t)
+	cid := mintClient(t, s)
+	_, challenge := pkcePair()
+	req := mcpReq(http.MethodGet, authorizeQuery(cid, clientCB, challenge, mcpResource, "st", "mcp"), nil)
+	addTokenCookies(req, s, Tokens{IDToken: "valid"})
+	w := httptest.NewRecorder()
+	s.handleAuthorizeGET(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("consent GET status = %d, want 200 (body=%s)", w.Code, w.Body.String())
+	}
+	if got := w.Header().Get("Referrer-Policy"); got != "same-origin" {
+		t.Fatalf("Referrer-Policy = %q, want same-origin (no-referrer forces Origin: null on the form POST)", got)
+	}
+}
+
 func TestAuthorizePOST(t *testing.T) {
 	_, challenge := pkcePair()
 

@@ -30,6 +30,14 @@ type authzErrorData struct {
 // renderConsent renders the approval page. Its CSP allows the inline styles and
 // a same-origin form POST (form-action 'self'), but no scripts and no other
 // destinations — the page is a pure HTML form.
+//
+// Referrer-Policy is "same-origin", NOT "no-referrer". This is load-bearing: the
+// Approve button is a plain top-level <form> POST (not fetch/CORS), and per the
+// Fetch spec a non-CORS POST under a "no-referrer" policy has its Origin header
+// set to the literal "null". handleAuthorizePOST's sameOrigin check would then
+// see Origin: null != the forwarded origin and reject every approval with "bad
+// origin". "same-origin" still strips the Referer on the cross-origin redirect
+// back to the client while keeping the real Origin on this same-origin POST.
 func (s *Server) renderConsent(w http.ResponseWriter, data *consentData) {
 	if data.BrandColor == "" {
 		data.BrandColor = s.cfg.BrandColor
@@ -37,7 +45,7 @@ func (s *Server) renderConsent(w http.ResponseWriter, data *consentData) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Frame-Options", "DENY")
-	w.Header().Set("Referrer-Policy", "no-referrer")
+	w.Header().Set("Referrer-Policy", "same-origin")
 	w.Header().Set("Content-Security-Policy",
 		"default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'")
 	if err := consentTemplate.Execute(w, data); err != nil {
