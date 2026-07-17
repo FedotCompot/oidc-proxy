@@ -480,6 +480,75 @@ func TestConsentReferrerPolicy(t *testing.T) {
 	}
 }
 
+// consentCSP renders the consent page for a client registered with redirectURI
+// and returns its Content-Security-Policy header.
+func consentCSP(t *testing.T, redirectURI string) string {
+	t.Helper()
+	s := newMCPServer(t)
+	cid := mintClient(t, s, redirectURI)
+	_, challenge := pkcePair()
+	req := mcpReq(http.MethodGet, authorizeQuery(cid, redirectURI, challenge, mcpResource, "st", "mcp"), nil)
+	addTokenCookies(req, s, Tokens{IDToken: "valid"})
+	w := httptest.NewRecorder()
+	s.handleAuthorizeGET(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("consent GET status = %d, want 200 (body=%s)", w.Code, w.Body.String())
+	}
+	return w.Header().Get("Content-Security-Policy")
+}
+
+// TestConsentFormActionCSP locks in the redirect-chain fix: form-action must
+// list 'self' (the initial POST to /oauth2/authorize) AND the exact origin the
+// server 302s to (the validated redirect_uri), origin-only with no path — or
+// Chromium/WebKit block the redirect back to the MCP client.
+func TestConsentFormActionCSP(t *testing.T) {
+	cases := []struct {
+		name, redirectURI, wantOrigin string
+	}{
+		{"loopback-127-with-port", "http://127.0.0.1:56137/callback", "http://127.0.0.1:56137"},
+		{"loopback-localhost-with-port", "http://localhost:8976/cb", "http://localhost:8976"},
+		{"ipv6-loopback", "http://[::1]:56137/callback", "http://[::1]:56137"},
+		{"https-with-port", "https://client.example.com:8443/cb", "https://client.example.com:8443"},
+		{"https-default-port", "https://client.example.com/callback", "https://client.example.com"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			csp := consentCSP(t, tc.redirectURI)
+			// Exact substring: 'self' + origin, immediately followed by the next
+			// directive — so any leaked path/trailing slash would fail the match.
+			want := "form-action 'self' " + tc.wantOrigin + "; base-uri 'none'"
+			if !strings.Contains(csp, want) {
+				t.Fatalf("CSP missing %q\nCSP: %s", want, csp)
+			}
+		})
+	}
+}
+
+// TestConsentFormActionRejectsMaliciousOrigin proves the header-injection guard:
+// a redirect origin carrying a CSP delimiter (open DCR lets a client register
+// hostnames url.Parse accepts, e.g. containing ';' or ',') is dropped rather
+// than emitted, leaving form-action 'self' alone.
+func TestConsentFormActionRejectsMaliciousOrigin(t *testing.T) {
+	s := newMCPServer(t)
+	for _, bad := range []string{
+		"https://ev;il.com",
+		"https://a,b.com",
+		"https://x'unsafe-inline'",
+		"https://a b.com",
+		"https://a\r\nb.com",
+	} {
+		w := httptest.NewRecorder()
+		s.renderConsent(w, &consentData{RedirectOrigin: bad})
+		csp := w.Header().Get("Content-Security-Policy")
+		if !strings.Contains(csp, "form-action 'self'; base-uri 'none'") {
+			t.Fatalf("origin %q was not dropped from CSP: %s", bad, csp)
+		}
+		if strings.Contains(csp, bad) {
+			t.Fatalf("malicious origin %q leaked into CSP: %s", bad, csp)
+		}
+	}
+}
+
 func TestAuthorizePOST(t *testing.T) {
 	_, challenge := pkcePair()
 

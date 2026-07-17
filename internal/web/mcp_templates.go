@@ -4,19 +4,26 @@ import (
 	"html/template"
 	"log"
 	"net/http"
+	"strings"
 )
 
 // consentData drives the MCP authorization consent screen. Everything on it is
-// either server-validated (RedirectHost, Resource, Scopes) or explicitly
-// labelled self-asserted (ClientName). AuthReq/CSRF are opaque hidden fields.
+// either server-validated (RedirectHost, RedirectOrigin, Resource, Scopes) or
+// explicitly labelled self-asserted (ClientName). AuthReq/CSRF are opaque
+// hidden fields.
 type consentData struct {
 	RedirectHost string
-	ClientName   string
-	Resource     string
-	Scopes       []string
-	AuthReq      string
-	CSRF         string
-	BrandColor   string
+	// RedirectOrigin is the scheme://host[:port] the Approve/Deny POST will be
+	// 302'd to. It is added to the page's form-action CSP so the browser follows
+	// that redirect (see renderConsent). Derived from the validated, exact-match
+	// redirect_uri via utils.OriginOf, so it carries no path and no userinfo.
+	RedirectOrigin string
+	ClientName     string
+	Resource       string
+	Scopes         []string
+	AuthReq        string
+	CSRF           string
+	BrandColor     string
 }
 
 // authzErrorData drives the HTML error pages returned before a validated
@@ -28,8 +35,22 @@ type authzErrorData struct {
 }
 
 // renderConsent renders the approval page. Its CSP allows the inline styles and
-// a same-origin form POST (form-action 'self'), but no scripts and no other
-// destinations — the page is a pure HTML form.
+// a form POST to 'self' plus the one validated redirect origin, but no scripts
+// and no other destinations — the page is a pure HTML form.
+//
+// form-action is scoped to 'self' AND data.RedirectOrigin, not 'self' alone.
+// Browsers (Chromium/WebKit) enforce form-action against every hop of a form
+// submission's redirect chain: the POST to /oauth2/authorize matches 'self',
+// but the server then 302s to the client's redirect_uri (e.g. a loopback
+// http://127.0.0.1:<port>/callback), and 'self' alone would block that hop, so
+// the code never reaches the client. Listing the exact, already-validated
+// redirect origin permits precisely that one destination and nothing else; it
+// works in every browser and keeps the "no other destinations" intent (dropping
+// form-action would leave submissions unrestricted, since it does NOT fall back
+// to default-src). The origin is dropped if it contains any character that could
+// break out of the CSP source list — url.Parse already rejects spaces and
+// CR/LF, but a hostname may still carry ';' ',' or a quote and DCR is open, so
+// we refuse to emit those rather than risk a malformed header.
 //
 // Referrer-Policy is "same-origin", NOT "no-referrer". This is load-bearing: the
 // Approve button is a plain top-level <form> POST (not fetch/CORS), and per the
@@ -42,12 +63,16 @@ func (s *Server) renderConsent(w http.ResponseWriter, data *consentData) {
 	if data.BrandColor == "" {
 		data.BrandColor = s.cfg.BrandColor
 	}
+	formAction := "'self'"
+	if data.RedirectOrigin != "" && !strings.ContainsAny(data.RedirectOrigin, " \t\r\n;,'\"") {
+		formAction += " " + data.RedirectOrigin
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Frame-Options", "DENY")
 	w.Header().Set("Referrer-Policy", "same-origin")
 	w.Header().Set("Content-Security-Policy",
-		"default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'")
+		"default-src 'none'; style-src 'unsafe-inline'; form-action "+formAction+"; base-uri 'none'")
 	if err := consentTemplate.Execute(w, data); err != nil {
 		log.Printf("mcp: consent render: %v", err)
 	}
