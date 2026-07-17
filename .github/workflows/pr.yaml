@@ -53,6 +53,11 @@ jobs:
       - name: Extract metadata (tags, labels) for Docker
         id: meta
         uses: docker/metadata-action@v5
+        env:
+          # Tag with the PR head commit, not the ephemeral refs/pull/N/merge
+          # commit that github.sha points to on pull_request events, so the
+          # image's sha tag matches a commit that exists in the branch history.
+          DOCKER_METADATA_PR_HEAD_SHA: true
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
