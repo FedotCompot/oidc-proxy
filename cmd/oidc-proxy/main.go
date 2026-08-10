@@ -38,7 +38,8 @@ func main() {
 		log.Fatalf("mcp: %v", err)
 	}
 	if as != nil {
-		log.Printf("mcp AS enabled (issuer=%s, resource=%s, kid=%s)", as.Issuer, as.Resource, as.KID())
+		log.Printf("mcp AS enabled (issuer=%s, resource=%s, kid=%s, cimd=%t)",
+			as.Issuer, as.Resource, as.KID(), as.CIMDEnabled())
 	}
 
 	srv := &http.Server{
@@ -74,6 +75,7 @@ func buildAS(cfg config.Config) (*mcpauth.AS, error) {
 		Resource:        cfg.MCPResource,
 		ResourceDocs:    cfg.MCPResourceDocs,
 		ScopesSupported: cfg.MCPScopesSupported,
+		RequiredScopes:  cfg.MCPRequiredScopes,
 		SigningKeyPEM:   signingPEM,
 		SigningKID:      cfg.MCPSigningKID,
 		EncKeyB64:       cfg.MCPEncKey,
@@ -81,5 +83,13 @@ func buildAS(cfg config.Config) (*mcpauth.AS, error) {
 		RefreshTTL:      cfg.MCPRefreshTokenTTL,
 		CodeTTL:         cfg.MCPCodeTTL,
 		AuthReqTTL:      cfg.MCPAuthReqTTL,
+		CIMD: mcpauth.CIMDOptions{
+			Enabled:           cfg.MCPCIMDEnabled,
+			AllowedHosts:      cfg.MCPCIMDAllowedHosts,
+			AllowPrivateHosts: cfg.MCPCIMDAllowPrivate,
+			CacheTTL:          cfg.MCPCIMDCacheTTL,
+			CacheSize:         cfg.MCPCIMDCacheSize,
+			Timeout:           cfg.MCPCIMDTimeout,
+		},
 	})
 }

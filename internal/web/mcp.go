@@ -20,12 +20,28 @@ const maxMCPBody = 64 << 10
 
 // ---- discovery / metadata ---------------------------------------------------
 
-func (s *Server) handleASMetadata(w http.ResponseWriter, _ *http.Request) {
+// handleASMetadata and handleOIDCConfig serve AS metadata at both the bare
+// well-known path and the path-suffixed form clients probe first when the
+// issuer carries a path (RFC 8414 §3.1). The suffix must match the issuer's.
+func (s *Server) handleASMetadata(w http.ResponseWriter, r *http.Request) {
+	if !s.issuerSuffixMatches(r) {
+		http.NotFound(w, r)
+		return
+	}
 	writeJSON(w, http.StatusOK, s.as.ASMetadata(false))
 }
 
-func (s *Server) handleOIDCConfig(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleOIDCConfig(w http.ResponseWriter, r *http.Request) {
+	if !s.issuerSuffixMatches(r) {
+		http.NotFound(w, r)
+		return
+	}
 	writeJSON(w, http.StatusOK, s.as.ASMetadata(true))
+}
+
+func (s *Server) issuerSuffixMatches(r *http.Request) bool {
+	suffix := r.PathValue("suffix")
+	return suffix == "" || suffix == s.as.IssuerSuffix()
 }
 
 // handlePRM serves RFC 9728 protected-resource metadata at both the bare path
@@ -45,12 +61,15 @@ func (s *Server) handleJWKS(w http.ResponseWriter, _ *http.Request) {
 
 // ---- dynamic client registration (RFC 7591) ---------------------------------
 
+// DCR is deprecated as of MCP 2026-07-28 (superseded by Client ID Metadata
+// Documents) but retained for clients that predate it.
 type dcrRequest struct {
 	ClientName              string   `json:"client_name"`
 	RedirectURIs            []string `json:"redirect_uris"`
 	GrantTypes              []string `json:"grant_types"`
 	ResponseTypes           []string `json:"response_types"`
 	TokenEndpointAuthMethod string   `json:"token_endpoint_auth_method"`
+	ApplicationType         string   `json:"application_type"`
 	Scope                   string   `json:"scope"`
 }
 
@@ -61,6 +80,7 @@ type dcrResponse struct {
 	GrantTypes              []string `json:"grant_types"`
 	ResponseTypes           []string `json:"response_types"`
 	TokenEndpointAuthMethod string   `json:"token_endpoint_auth_method"`
+	ApplicationType         string   `json:"application_type"`
 	ClientName              string   `json:"client_name,omitempty"`
 	Scope                   string   `json:"scope,omitempty"`
 }
@@ -91,10 +111,17 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	for _, uri := range req.RedirectURIs {
-		if err := validateRedirectURI(uri); err != nil {
+		if err := mcpauth.ValidateRedirectURI(uri); err != nil {
 			writeError(w, http.StatusBadRequest, "invalid_redirect_uri", err.Error())
 			return
 		}
+	}
+
+	// application_type is echoed, not enforced: this AS applies the same
+	// redirect-URI rules (https or loopback http) to native and web clients.
+	appType := req.ApplicationType
+	if appType == "" {
+		appType = "web" // OIDC Dynamic Client Registration default
 	}
 
 	clientID, err := s.as.MintClientID(mcpauth.ClientRegistration{
@@ -124,6 +151,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		GrantTypes:              grantTypes,
 		ResponseTypes:           responseTypes,
 		TokenEndpointAuthMethod: "none",
+		ApplicationType:         appType,
 		ClientName:              req.ClientName,
 		Scope:                   req.Scope,
 	})
@@ -136,10 +164,21 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 // confused-deputy mitigation): a code is only minted by the guarded POST.
 func (s *Server) handleAuthorizeGET(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
+	clientID := q.Get("client_id")
 
-	// 1. client_id must decode to a registered client.
-	client, err := s.as.VerifyClientID(q.Get("client_id"))
+	// 1. client_id must resolve to a client: either an AS-issued (DCR) client_id
+	// or a Client ID Metadata Document URL we fetch and validate. The CIMD path
+	// makes an outbound request, so it is rate limited per IP.
+	if mcpauth.IsURLClientID(clientID) && !s.cimdLimiter.allow(utils.ClientIP(r)) {
+		s.renderAuthzError(w, http.StatusTooManyRequests, "Too many requests",
+			"Too many authorization requests. Please try again in a minute.")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	client, err := s.as.ResolveClient(ctx, clientID)
 	if err != nil {
+		log.Printf("mcp: resolve client_id: %v", err)
 		s.renderAuthzError(w, http.StatusBadRequest, "Invalid request",
 			"The client_id is missing or invalid. Re-register the client and try again.")
 		return
@@ -182,24 +221,31 @@ func (s *Server) handleAuthorizeGET(w http.ResponseWriter, r *http.Request) {
 	}
 	resource := s.as.Resource
 
-	// 6. Authenticate via the Entra session cookie (mirrors handleVerify).
+	// 6. Resolve the granted scope up front so consent shows exactly what the
+	// token will carry.
+	scope, err := s.as.GrantScope(q.Get("scope"))
+	if err != nil {
+		s.authorizeRedirectError(w, r, redirectURI, "invalid_scope", err.Error(), state)
+		return
+	}
+
+	// 7. Authenticate via the Entra session cookie (mirrors handleVerify).
 	idTok, ok := s.authenticateBrowser(w, r)
 	if !ok {
 		return // authenticateBrowser issued the sign-in/refresh redirect
 	}
 
-	// 7. Allowlist.
+	// 8. Allowlist.
 	if !s.userAllowed(idTok.Email) {
 		s.renderAuthzError(w, http.StatusForbidden, "Access denied",
 			"Your account is not permitted to access this resource.")
 		return
 	}
 
-	// 8. Seal the consent-request blob and render consent. The code is minted
+	// 9. Seal the consent-request blob and render consent. The code is minted
 	// only when the user approves via the same-origin POST.
-	scope := q.Get("scope")
 	blob, csrf, err := s.as.MintAuthReq(mcpauth.AuthReqInput{
-		ClientID:      q.Get("client_id"),
+		ClientID:      clientID,
 		RedirectURI:   redirectURI,
 		CodeChallenge: challenge,
 		Resource:      resource,
@@ -219,8 +265,10 @@ func (s *Server) handleAuthorizeGET(w http.ResponseWriter, r *http.Request) {
 		RedirectHost:   hostOf(redirectURI),
 		RedirectOrigin: utils.OriginOf(redirectURI),
 		ClientName:     client.ClientName,
+		ClientHost:     cimdHost(client),
+		LoopbackOnly:   client.LocalhostOnly(),
 		Resource:       s.as.Resource,
-		Scopes:         splitScopes(scope, s.as.ScopesSupported),
+		Scopes:         strings.Fields(scope),
 		AuthReq:        blob,
 		CSRF:           csrf,
 		BrandColor:     s.cfg.BrandColor,
@@ -287,10 +335,12 @@ func (s *Server) handleAuthorizePOST(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 6. Deliver the code.
+	// 6. Deliver the code. iss lets the client detect a mix-up attack before it
+	// redeems the code (RFC 9207, required by MCP 2026-07-28).
 	u, _ := url.Parse(authReq.RedirectURI)
 	qq := u.Query()
 	qq.Set("code", code)
+	qq.Set("iss", s.as.Issuer)
 	if authReq.State != "" {
 		qq.Set("state", authReq.State)
 	}
@@ -434,6 +484,14 @@ func (s *Server) handleMCPVerify(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Insufficient scope is 403 + a challenge naming what the operation needs,
+	// so the client can run a step-up authorization (RFC 6750 §3.1).
+	if !s.as.HasRequiredScopes(claims.Scope) {
+		w.Header().Set("WWW-Authenticate", s.wwwAuthenticate("insufficient_scope"))
+		http.Error(w, "insufficient scope", http.StatusForbidden)
+		return
+	}
+
 	if claims.Email != "" {
 		w.Header().Set("X-Auth-Request-Email", claims.Email)
 	}
@@ -529,11 +587,16 @@ func writeTokenGrant(w http.ResponseWriter, g mcpauth.TokenGrant) {
 }
 
 // wwwAuthenticate builds the RFC 6750 challenge. resource_metadata (canonical,
-// from MCP_RESOURCE) is always present; errCode is added only when non-empty.
+// from MCP_RESOURCE) is always present; errCode and the required-scope hint are
+// added only when non-empty. Clients treat the challenged scope as
+// authoritative for the current operation (MCP 2026-07-28 scope selection).
 func (s *Server) wwwAuthenticate(errCode string) string {
 	v := `Bearer resource_metadata="` + s.as.PRMURL() + `"`
 	if errCode != "" {
 		v += `, error="` + errCode + `"`
+	}
+	if scope := s.as.RequiredScope(); scope != "" {
+		v += `, scope="` + scope + `"`
 	}
 	return v
 }
@@ -547,6 +610,7 @@ func (s *Server) authorizeRedirectError(w http.ResponseWriter, r *http.Request, 
 	}
 	q := u.Query()
 	q.Set("error", code)
+	q.Set("iss", s.as.Issuer) // RFC 9207 applies to error responses too
 	if desc != "" {
 		q.Set("error_description", desc)
 	}
@@ -557,38 +621,6 @@ func (s *Server) authorizeRedirectError(w http.ResponseWriter, r *http.Request, 
 	w.Header().Set("Referrer-Policy", "no-referrer")
 	http.Redirect(w, r, u.String(), http.StatusFound)
 }
-
-// validateRedirectURI enforces the MCP/OAuth 2.1 constraints: absolute URI,
-// HTTPS or loopback http, no fragment.
-func validateRedirectURI(raw string) error {
-	u, err := url.Parse(raw)
-	if err != nil {
-		return errInvalidRedirect("not a valid URI")
-	}
-	if !u.IsAbs() || u.Host == "" {
-		return errInvalidRedirect("must be an absolute URI")
-	}
-	if u.Fragment != "" || strings.Contains(raw, "#") {
-		return errInvalidRedirect("must not contain a fragment")
-	}
-	switch u.Scheme {
-	case "https":
-		return nil
-	case "http":
-		switch u.Hostname() {
-		case "127.0.0.1", "::1", "localhost":
-			return nil
-		}
-		return errInvalidRedirect("http is only allowed for loopback (127.0.0.1 / localhost)")
-	default:
-		return errInvalidRedirect("scheme must be https or loopback http")
-	}
-}
-
-type redirectError string
-
-func (e redirectError) Error() string           { return string(e) }
-func errInvalidRedirect(s string) redirectError { return redirectError(s) }
 
 // exactMatch reports whether candidate is byte-for-byte one of the registered
 // URIs (redirect URIs are matched exactly, never by prefix/normalization).
@@ -631,12 +663,12 @@ func redirectHosts(uris []string) []string {
 	return out
 }
 
-// splitScopes returns the requested scopes for display, falling back to the
-// AS-advertised scopes when the client requested none.
-func splitScopes(scope string, fallback []string) []string {
-	fields := strings.Fields(scope)
-	if len(fields) == 0 {
-		return fallback
+// cimdHost is the host that vouches for a CIMD client's metadata — the one
+// piece of the client's identity the AS actually verified. Empty for DCR
+// clients, whose metadata is wholly self-asserted.
+func cimdHost(c *mcpauth.ClientMetadata) string {
+	if !c.CIMD {
+		return ""
 	}
-	return fields
+	return hostOf(c.ClientID)
 }

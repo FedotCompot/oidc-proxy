@@ -19,11 +19,18 @@ type consentData struct {
 	// redirect_uri via utils.OriginOf, so it carries no path and no userinfo.
 	RedirectOrigin string
 	ClientName     string
-	Resource       string
-	Scopes         []string
-	AuthReq        string
-	CSRF           string
-	BrandColor     string
+	// ClientHost is the host of a Client ID Metadata Document client_id — the
+	// domain that served the metadata, and the only part of a CIMD client's
+	// identity this AS verified. Empty for DCR clients.
+	ClientHost string
+	// LoopbackOnly marks a client whose redirect URIs are all loopback, which
+	// no authorization server can tell apart from any other local process.
+	LoopbackOnly bool
+	Resource     string
+	Scopes       []string
+	AuthReq      string
+	CSRF         string
+	BrandColor   string
 }
 
 // authzErrorData drives the HTML error pages returned before a validated
@@ -110,6 +117,10 @@ const consentStyles = `<style>
   .consent-list .k { color: #6b7280; }
   .consent-list .v { text-align: right; word-break: break-all; font-weight: 500; }
   .unverified { color: #9a6b00; font-size: 12px; }
+  .consent-warning {
+    font-size: 13px; margin: 0 0 20px; padding: 12px 14px; border-radius: 10px;
+    color: #7a5500; background: #fff8e6; border: 1px solid #f0dca8;
+  }
   .scopes { display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end; }
   .scope { background: color-mix(in srgb, var(--accent) 12%, transparent); color: var(--accent); border-radius: 999px; padding: 2px 10px; font-size: 12px; font-weight: 500; }
   .actions { display: flex; gap: 12px; margin-top: 8px; }
@@ -119,6 +130,7 @@ const consentStyles = `<style>
   @media (prefers-color-scheme: dark) {
     .consent-list li { border-color: #2c2f37; }
     .unverified { color: #d9a441; }
+    .consent-warning { color: #e6c169; background: #2a2416; border-color: #4a3f22; }
   }
 </style>`
 
@@ -143,9 +155,11 @@ var consentTemplate = template.Must(template.New("consent").Parse(`<!doctype htm
   <p class="consent-anchor">You'll be returned to <strong>{{.RedirectHost}}</strong>. Only approve if you started this sign-in from an app you trust — this host is where your authorization will be delivered.</p>
   <ul class="consent-list">
     {{if .ClientName}}<li><span class="k">App name <span class="unverified">(unverified)</span></span><span class="v">{{.ClientName}}</span></li>{{end}}
+    {{if .ClientHost}}<li><span class="k">Published by</span><span class="v">{{.ClientHost}}</span></li>{{end}}
     <li><span class="k">Resource</span><span class="v">{{.Resource}}</span></li>
     <li><span class="k">Scopes</span><span class="v"><span class="scopes">{{range .Scopes}}<span class="scope">{{.}}</span>{{end}}</span></span></li>
   </ul>
+  {{if .LoopbackOnly}}<p class="consent-warning">This app receives your authorization on <strong>this device</strong>. Anything running locally could be listening — only approve if you just started this sign-in yourself.</p>{{end}}
   <form method="post" action="/oauth2/authorize">
     <input type="hidden" name="authreq" value="{{.AuthReq}}">
     <input type="hidden" name="csrf" value="{{.CSRF}}">

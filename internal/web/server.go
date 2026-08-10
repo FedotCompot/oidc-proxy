@@ -17,7 +17,10 @@ import (
 const (
 	registerRateLimit = 20 // per window
 	tokenRateLimit    = 120
-	rateLimitWindow   = time.Minute
+	// cimdRateLimit caps authorize requests carrying a URL client_id, since
+	// each cache miss makes the AS fetch an attacker-chosen URL.
+	cimdRateLimit   = 30
+	rateLimitWindow = time.Minute
 )
 
 type Server struct {
@@ -29,6 +32,7 @@ type Server struct {
 	as           *mcpauth.AS
 	regLimiter   *rateLimiter
 	tokenLimiter *rateLimiter
+	cimdLimiter  *rateLimiter
 }
 
 func NewServer(cfg config.Config, provider *oidc.Provider, verifyFn token.VerifyFunc, as *mcpauth.AS) *Server {
@@ -36,6 +40,7 @@ func NewServer(cfg config.Config, provider *oidc.Provider, verifyFn token.Verify
 	if as != nil {
 		s.regLimiter = newRateLimiter(registerRateLimit, rateLimitWindow)
 		s.tokenLimiter = newRateLimiter(tokenRateLimit, rateLimitWindow)
+		s.cimdLimiter = newRateLimiter(cimdRateLimit, rateLimitWindow)
 	}
 	return s
 }
@@ -62,7 +67,9 @@ func (s *Server) Routes() http.Handler {
 // the /.well-known discovery paths need a new public route rule (see README).
 func (s *Server) registerMCPRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /.well-known/oauth-authorization-server", s.handleASMetadata)
+	mux.HandleFunc("GET /.well-known/oauth-authorization-server/{suffix...}", s.handleASMetadata)
 	mux.HandleFunc("GET /.well-known/openid-configuration", s.handleOIDCConfig)
+	mux.HandleFunc("GET /.well-known/openid-configuration/{suffix...}", s.handleOIDCConfig)
 	mux.HandleFunc("GET /.well-known/oauth-protected-resource", s.handlePRM)
 	mux.HandleFunc("GET /.well-known/oauth-protected-resource/{suffix...}", s.handlePRM)
 	mux.HandleFunc("GET /oauth2/jwks.json", s.handleJWKS)

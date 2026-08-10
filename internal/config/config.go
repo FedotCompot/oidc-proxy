@@ -44,6 +44,17 @@ type Config struct {
 	MCPCodeTTL         time.Duration `envconfig:"MCP_CODE_TTL" default:"60s"`
 	MCPAuthReqTTL      time.Duration `envconfig:"MCP_AUTHREQ_TTL" default:"5m"`
 	MCPScopesSupported []string      `envconfig:"MCP_SCOPES_SUPPORTED" default:"mcp"`
+	MCPRequiredScopes  []string      `envconfig:"MCP_REQUIRED_SCOPES"`
+
+	// Client ID Metadata Documents (MCP rev 2026-07-28). Enabled by default:
+	// it is the registration mechanism current clients prefer, and it keeps the
+	// AS stateless. See internal/mcpauth/cimd.go for the fetch safeguards.
+	MCPCIMDEnabled      bool          `envconfig:"MCP_CIMD_ENABLED" default:"true"`
+	MCPCIMDAllowedHosts []string      `envconfig:"MCP_CIMD_ALLOWED_HOSTS"`
+	MCPCIMDAllowPrivate bool          `envconfig:"MCP_CIMD_ALLOW_PRIVATE_HOSTS" default:"false"`
+	MCPCIMDCacheTTL     time.Duration `envconfig:"MCP_CIMD_CACHE_TTL" default:"15m"`
+	MCPCIMDCacheSize    int           `envconfig:"MCP_CIMD_CACHE_SIZE" default:"512"`
+	MCPCIMDTimeout      time.Duration `envconfig:"MCP_CIMD_TIMEOUT" default:"5s"`
 }
 
 // brandColorRe accepts CSS hex colors (#rgb, #rgba, #rrggbb, #rrggbbaa).
@@ -72,6 +83,7 @@ func Load() (Config, error) {
 	}
 	// Normalize advertised MCP scopes; drop blanks so metadata/PRM/tokens agree.
 	c.MCPScopesSupported = normalizeScopes(c.MCPScopesSupported)
+	c.MCPRequiredScopes = normalizeScopes(c.MCPRequiredScopes)
 	if err := c.validateMCP(); err != nil {
 		return c, err
 	}
