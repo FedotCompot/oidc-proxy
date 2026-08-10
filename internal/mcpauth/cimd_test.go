@@ -324,6 +324,57 @@ func TestResolveClientRejectsEmpty(t *testing.T) {
 	}
 }
 
+// RFC 8252 §7.3: a native client binds an ephemeral port at launch, so it
+// publishes a portless loopback URI and arrives on whatever port it got.
+func TestMatchRedirectURILoopbackPort(t *testing.T) {
+	registered := []string{"http://localhost/callback", "http://127.0.0.1/callback"}
+
+	match := []string{
+		"http://localhost:57351/callback",
+		"http://127.0.0.1:1/callback",
+		"http://localhost/callback", // portless, byte-exact
+	}
+	for _, uri := range match {
+		if !MatchRedirectURI(registered, uri) {
+			t.Errorf("MatchRedirectURI rejected %q", uri)
+		}
+	}
+
+	noMatch := []string{
+		"http://localhost:57351/other",        // path must still match
+		"https://localhost:57351/callback",    // scheme must still match
+		"http://evil.example:57351/callback",  // not loopback
+		"http://localhost:57351/callback?x=1", // query must still match
+		"http://a@localhost:57351/callback",   // userinfo must not ride in
+		"http://localhost:57351/callback#f",   // fragment must not ride in
+		"",
+	}
+	for _, uri := range noMatch {
+		if MatchRedirectURI(registered, uri) {
+			t.Errorf("MatchRedirectURI accepted %q", uri)
+		}
+	}
+}
+
+// The port relaxation is loopback-only: a public https client still matches
+// byte-for-byte, so a stolen code cannot be steered to another port.
+func TestMatchRedirectURIHTTPSStaysExact(t *testing.T) {
+	registered := []string{"https://client.example.com/callback"}
+
+	if !MatchRedirectURI(registered, "https://client.example.com/callback") {
+		t.Error("exact https redirect_uri rejected")
+	}
+	for _, uri := range []string{
+		"https://client.example.com:8443/callback",
+		"https://client.example.com/callback/",
+		"https://Client.Example.com/callback",
+	} {
+		if MatchRedirectURI(registered, uri) {
+			t.Errorf("MatchRedirectURI accepted non-exact https URI %q", uri)
+		}
+	}
+}
+
 func TestIsURLClientID(t *testing.T) {
 	if !IsURLClientID("https://app.example.com/client.json") {
 		t.Error("https client_id not detected as a URL")

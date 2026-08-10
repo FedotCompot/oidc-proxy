@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -324,6 +325,41 @@ func ValidateRedirectURI(raw string) error {
 	default:
 		return fmt.Errorf("scheme must be https or loopback http")
 	}
+}
+
+// MatchRedirectURI reports whether candidate is one of the registered URIs.
+//
+// Non-loopback URIs must match byte-for-byte. Loopback URIs match on
+// everything except the port, which RFC 8252 §7.3 requires an authorization
+// server to allow: a native client takes an ephemeral port from the OS when it
+// starts its callback listener, so it cannot publish one ahead of time (Claude
+// Code registers "http://localhost/callback" and arrives on :57351). The
+// relaxation is confined to loopback, where the redirect can only ever reach
+// the user's own machine.
+func MatchRedirectURI(registered []string, candidate string) bool {
+	if candidate == "" {
+		return false
+	}
+	if slices.Contains(registered, candidate) {
+		return true
+	}
+	got, err := url.Parse(candidate)
+	// userinfo would let "http://trusted.example@localhost/cb" ride in on a
+	// portless match, so a loopback candidate carrying any is refused.
+	if err != nil || got.User != nil || got.Fragment != "" || !isLoopbackHost(got.Hostname()) {
+		return false
+	}
+	for _, raw := range registered {
+		want, err := url.Parse(raw)
+		if err != nil || !isLoopbackHost(want.Hostname()) {
+			continue
+		}
+		if want.Scheme == got.Scheme && want.Hostname() == got.Hostname() &&
+			want.Path == got.Path && want.RawQuery == got.RawQuery {
+			return true
+		}
+	}
+	return false
 }
 
 func isLoopbackHost(host string) bool {

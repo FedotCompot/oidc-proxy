@@ -225,7 +225,11 @@ A client publishes a JSON document at an `https` URL with a path
 `client_id`. The AS resolves it on `GET /oauth2/authorize` and requires
 `client_id` (matching the URL exactly), `client_name`, and `redirect_uris`.
 The authorization request's `redirect_uri` must match one of them exactly, as
-with a registered client.
+with a registered client — except for **loopback** URIs, where the port is
+ignored (RFC 8252 §7.3). A native client takes an ephemeral port from the OS
+when it opens its callback listener, so it publishes `http://localhost/callback`
+and arrives on `http://localhost:57351/callback`; scheme, host, path and query
+must still match, and the relaxation never applies to `https` URIs.
 
 Because the AS fetches an attacker-chosen URL, the fetch is fenced in:
 non-public destinations are refused after DNS resolution (SSRF), redirects are

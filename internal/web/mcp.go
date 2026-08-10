@@ -8,7 +8,6 @@ import (
 	"log"
 	"net/http"
 	"net/url"
-	"slices"
 	"strings"
 	"time"
 
@@ -188,7 +187,7 @@ func (s *Server) handleAuthorizeGET(w http.ResponseWriter, r *http.Request) {
 	// 2. redirect_uri must exactly match a registered URI (never redirect to an
 	// unvalidated URI). All later errors go back to this redirect_uri.
 	redirectURI := q.Get("redirect_uri")
-	if !exactMatch(client.RedirectURIs, redirectURI) {
+	if !mcpauth.MatchRedirectURI(client.RedirectURIs, redirectURI) {
 		s.renderAuthzError(w, http.StatusBadRequest, "Invalid request",
 			"The redirect_uri does not match any registered URI for this client.")
 		return
@@ -633,12 +632,6 @@ func (s *Server) authorizeRedirectError(w http.ResponseWriter, r *http.Request, 
 	u.RawQuery = q.Encode()
 	w.Header().Set("Referrer-Policy", "no-referrer")
 	http.Redirect(w, r, u.String(), http.StatusFound)
-}
-
-// exactMatch reports whether candidate is byte-for-byte one of the registered
-// URIs (redirect URIs are matched exactly, never by prefix/normalization).
-func exactMatch(registered []string, candidate string) bool {
-	return candidate != "" && slices.Contains(registered, candidate)
 }
 
 // reconstructAuthorizeURL rebuilds the relative /oauth2/authorize URL from a

@@ -183,6 +183,32 @@ func TestAuthorizeCIMDRedirectURIMustMatchDocument(t *testing.T) {
 	}
 }
 
+// Claude Code publishes portless loopback redirect URIs and arrives on an
+// ephemeral port, which RFC 8252 §7.3 requires the AS to accept. Byte-exact
+// matching made every native CIMD client fail at the authorize step.
+func TestAuthorizeCIMDLoopbackEphemeralPort(t *testing.T) {
+	s := newMCPServer(t)
+	clientID := cimdDoc(t, s, []string{"http://localhost/callback", "http://127.0.0.1/callback"})
+	_, challenge := pkcePair()
+
+	const ephemeral = "http://localhost:57351/callback"
+	req := mcpReq(http.MethodGet, authorizeQuery(clientID, ephemeral, challenge, mcpResource, "st", "mcp"), nil)
+	addTokenCookies(req, s, Tokens{IDToken: "valid"})
+	w := httptest.NewRecorder()
+	s.handleAuthorizeGET(w, req)
+	if w.Code != 200 {
+		t.Fatalf("consent GET status = %d, want 200 (body=%s)", w.Code, w.Body.String())
+	}
+
+	// The code must come back to the port that was actually requested.
+	authreq, csrf := extractConsent(t, w.Body.String())
+	aw := postApprove(s, authreq, csrf, "approve", mcpIssuer, "valid")
+	loc, _ := url.Parse(aw.Header().Get("Location"))
+	if loc.Host != "localhost:57351" || loc.Path != "/callback" {
+		t.Fatalf("redirected to %s, want the requested ephemeral port", loc)
+	}
+}
+
 func TestAuthorizeCIMDLoopbackWarning(t *testing.T) {
 	s := newMCPServer(t)
 	const loopback = "http://127.0.0.1:3000/callback"
