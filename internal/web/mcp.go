@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
 	"net/url"
@@ -420,17 +421,29 @@ func (s *Server) tokenRefresh(w http.ResponseWriter, r *http.Request) {
 	f := r.PostForm
 	refresh, err := s.as.VerifyRefreshToken(f.Get("refresh_token"))
 	if err != nil {
+		// Log a fixed classification, never the error: a rejected refresh forces
+		// a full browser re-auth, and "expired" (raise MCP_REFRESH_TOKEN_TTL)
+		// vs "invalid" is the only thing an operator needs to tell them apart.
+		reason := "invalid"
+		if errors.Is(err, mcpauth.ErrExpired) {
+			reason = "expired"
+		}
+		log.Printf("mcp: refresh rejected (%s)", reason)
 		writeError(w, http.StatusBadRequest, "invalid_grant", "refresh_token is invalid or expired")
 		return
 	}
 	// Public clients send client_id; when present it must bind to the token.
 	if cid := f.Get("client_id"); cid != "" && subtle.ConstantTimeCompare([]byte(cid), []byte(refresh.ClientID)) != 1 {
+		log.Printf("mcp: refresh rejected (client_id mismatch) jti=%s", refresh.ID)
 		writeError(w, http.StatusBadRequest, "invalid_grant", "client_id mismatch")
 		return
 	}
 	// Rotation: burn the presented token; a reused (already-rotated) token is
 	// rejected (best-effort per-replica — see mcpauth.ReplayGuard).
 	if s.as.Guard.SeenBefore(refresh.ID, s.as.RefreshTTL) {
+		// Same jti twice in quick succession is a retried or concurrent refresh,
+		// not theft; family ties the rotation lineage together across both.
+		log.Printf("mcp: refresh rejected (already used) jti=%s family=%s", refresh.ID, refresh.Family)
 		writeError(w, http.StatusBadRequest, "invalid_grant", "refresh_token already used")
 		return
 	}

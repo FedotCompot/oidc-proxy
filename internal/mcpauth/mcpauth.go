@@ -123,7 +123,7 @@ func New(opts Options) (*AS, error) {
 		RequiredScopes:    opts.RequiredScopes,
 		cimd:              cimd,
 		AccessTTL:         orDefault(opts.AccessTTL, 15*time.Minute),
-		RefreshTTL:        orDefault(opts.RefreshTTL, 8*time.Hour),
+		RefreshTTL:        orDefault(opts.RefreshTTL, 30*24*time.Hour),
 		CodeTTL:           orDefault(opts.CodeTTL, 60*time.Second),
 		AuthReqTTL:        orDefault(opts.AuthReqTTL, 5*time.Minute),
 		Guard:             guard,

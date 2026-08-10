@@ -294,7 +294,7 @@ redirects — only `200` / `401` / `403`.
 | `MCP_SIGNING_KID` | no | JWK thumbprint | `kid` for the signing key |
 | `MCP_ENC_KEY` | no | HKDF from signing key | 32-byte base64 key for the code/consent JWEs (A256GCM) |
 | `MCP_ACCESS_TOKEN_TTL` | no | `15m` | Access-token lifetime |
-| `MCP_REFRESH_TOKEN_TTL` | no | `8h` | Refresh lifetime — short on purpose (see below) |
+| `MCP_REFRESH_TOKEN_TTL` | no | `720h` | Refresh lifetime, as a sliding window — an idle gap longer than this forces a full re-auth (see below) |
 | `MCP_CODE_TTL` | no | `60s` | Authorization-code lifetime |
 | `MCP_AUTHREQ_TTL` | no | `5m` | Consent-request blob lifetime |
 | `MCP_SCOPES_SUPPORTED` | no | `mcp` | Advertised scopes (drives metadata + PRM). A request for anything outside this set is `invalid_scope`; a request with no `scope` grants all of them |
@@ -345,10 +345,23 @@ claude mcp add --transport http docs https://docs.example.com/mcp
 # → browser opens Microsoft SSO → consent → done (no manual token)
 ```
 
-> **Refresh-token TTL is short on purpose.** Per-replica reuse detection is
-> best-effort (there is no shared store), so a leaked refresh token is
-> otherwise undetectable for its whole life. Raise `MCP_REFRESH_TOKEN_TTL`
-> only once a shared `ReplayGuard` (e.g. Redis) backs reuse detection.
+> **Refresh-token lifetime is a sliding window.** Every refresh mints a fresh
+> token expiring `MCP_REFRESH_TOKEN_TTL` from *that moment*, so an actively
+> used session never expires; the TTL only bites after an idle gap longer
+> than it. At the former 8h default that meant a full browser re-auth every
+> morning, which is why the default is now 30d.
+>
+> The cost is that per-replica reuse detection is best-effort (there is no
+> shared store), so a leaked refresh token is undetectable for its whole
+> life — a longer TTL widens that window. Lower `MCP_REFRESH_TOKEN_TTL` if
+> that trade doesn't suit you, or keep it long once a shared `ReplayGuard`
+> (e.g. Redis) backs reuse detection.
+>
+> A rejected refresh forces a full re-auth and logs a classification you can
+> grep for: `refresh rejected (expired)` means the TTL is too short for your
+> usage pattern, while `refresh rejected (already used)` means the same token
+> was presented twice — a retried or concurrent refresh racing rotation,
+> which no TTL change will fix.
 
 ## Security model
 

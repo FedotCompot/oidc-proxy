@@ -41,7 +41,7 @@ services:
       # MCP_RESOURCE: https://app.example.com/mcp
       # MCP_SIGNING_KEY_FILE: /run/secrets/mcp_signing_key
       # MCP_ACCESS_TOKEN_TTL: 15m
-      # MCP_REFRESH_TOKEN_TTL: 8h
+      # MCP_REFRESH_TOKEN_TTL: 720h
       # Client ID Metadata Documents are on by default; narrow which hosts may
       # publish them with:
       # MCP_CIMD_ALLOWED_HOSTS: claude.ai,*.cursor.sh

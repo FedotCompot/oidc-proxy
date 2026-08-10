@@ -1,12 +1,18 @@
 package mcpauth
 
 import (
+	"errors"
 	"fmt"
 	"time"
 
 	jose "github.com/go-jose/go-jose/v4"
 	"github.com/go-jose/go-jose/v4/jwt"
 )
+
+// ErrExpired marks an artifact that verified but is past its expiry. Callers
+// classify on it to tell a routine timeout apart from a malformed or forged
+// artifact without logging any token-derived bytes.
+var ErrExpired = errors.New("expired")
 
 // token_use discriminates the five artifact kinds. Every artifact carries one
 // and every verification site asserts an exact match, so an artifact of one
@@ -379,6 +385,9 @@ func (as *AS) VerifyRefreshToken(token string) (*RefreshClaims, error) {
 		return nil, fmt.Errorf("wrong token_use %q, want %q", c.TokenUse, useRefresh)
 	}
 	if err := c.ValidateWithLeeway(jwt.Expected{Time: as.now()}, clockSkewLeeway); err != nil {
+		if errors.Is(err, jwt.ErrExpired) {
+			return nil, ErrExpired
+		}
 		return nil, err
 	}
 	return &c, nil

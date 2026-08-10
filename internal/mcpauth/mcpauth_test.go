@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -323,5 +324,31 @@ func TestReplayGuard(t *testing.T) {
 	}
 	if g.SeenBefore("b", time.Minute) {
 		t.Error("SeenBefore(b) = true, want false")
+	}
+}
+
+// An expired refresh token must be distinguishable from a forged one: the
+// token endpoint logs that classification, and it is what tells an operator
+// whether MCP_REFRESH_TOKEN_TTL is too short.
+func TestVerifyRefreshTokenClassifiesExpiry(t *testing.T) {
+	as := newTestAS(t)
+	as.RefreshTTL = time.Hour
+	grant, err := as.IssueGrant(GrantInput{Sub: "user-1", ClientID: "cid", Resource: testResource})
+	if err != nil {
+		t.Fatalf("IssueGrant: %v", err)
+	}
+
+	if _, err := as.VerifyRefreshToken(grant.RefreshToken); err != nil {
+		t.Fatalf("fresh refresh token rejected: %v", err)
+	}
+
+	as.nowFn = func() time.Time { return time.Now().Add(2 * time.Hour) }
+	_, err = as.VerifyRefreshToken(grant.RefreshToken)
+	if !errors.Is(err, ErrExpired) {
+		t.Fatalf("expired refresh token gave %v, want ErrExpired", err)
+	}
+
+	if _, err := as.VerifyRefreshToken("not-a-token"); errors.Is(err, ErrExpired) {
+		t.Fatal("a malformed token must not be classified as expired")
 	}
 }

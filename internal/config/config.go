@@ -40,7 +40,7 @@ type Config struct {
 	MCPSigningKID      string        `envconfig:"MCP_SIGNING_KID"`
 	MCPEncKey          string        `envconfig:"MCP_ENC_KEY"`
 	MCPAccessTokenTTL  time.Duration `envconfig:"MCP_ACCESS_TOKEN_TTL" default:"15m"`
-	MCPRefreshTokenTTL time.Duration `envconfig:"MCP_REFRESH_TOKEN_TTL" default:"8h"`
+	MCPRefreshTokenTTL time.Duration `envconfig:"MCP_REFRESH_TOKEN_TTL" default:"720h"`
 	MCPCodeTTL         time.Duration `envconfig:"MCP_CODE_TTL" default:"60s"`
 	MCPAuthReqTTL      time.Duration `envconfig:"MCP_AUTHREQ_TTL" default:"5m"`
 	MCPScopesSupported []string      `envconfig:"MCP_SCOPES_SUPPORTED" default:"mcp"`
