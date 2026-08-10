@@ -184,7 +184,7 @@ Standard SPA / public-client registration with PKCE. No special setup.
 ## MCP authorization
 
 `oidc-proxy` can additionally act as an **MCP-compliant OAuth 2.1
-Authorization Server** (MCP spec rev 2025-06-18) in front of a remote HTTP
+Authorization Server** (MCP spec rev 2026-07-28) in front of a remote HTTP
 MCP server, so AI-agent clients (Claude Code, Cursor, VS Code, `mcp-remote`,
 …) authenticate with the **same Microsoft Entra ID SSO** your human users
 already use — per-user identity, no shared secrets, zero client config.
@@ -197,9 +197,47 @@ cookie flow completely untouched. When enabled, the proxy:
   Entra tokens upstream (**no token passthrough**);
 - authenticates the browser at `/oauth2/authorize` purely by checking for a
   valid Entra session cookie (reusing the existing sign-in / refresh pages);
-- is **stateless** — every artifact (client_id, consent blob, code, access &
-  refresh token) is a self-contained JWS/JWE, so it scales to multiple
-  replicas with no shared store.
+- accepts **Client ID Metadata Documents** — a client identifies itself with
+  an `https` URL it hosts, so there is no registration step and no client
+  record on either side;
+- is **stateless end to end** — every artifact (client_id, consent blob, code,
+  access & refresh token) is a self-contained JWS/JWE, so it scales to
+  multiple replicas with no shared store.
+
+### What rev 2026-07-28 changes
+
+| Change | How it lands here |
+| --- | --- |
+| **Client ID Metadata Documents** (CIMD) replace registration | `client_id` may be an `https` URL; the AS fetches, validates and caches the document. Advertised as `client_id_metadata_document_supported` |
+| **DCR deprecated** | `/oauth2/register` still works, unchanged, for older clients. `application_type` is accepted and echoed |
+| **RFC 9207 issuer identification** | Every authorization response — success *and* error — carries `iss`, advertised as `authorization_response_iss_parameter_supported` |
+| **Scope challenges / step-up** | 401 and 403 challenges carry a `scope` hint; a token missing `MCP_REQUIRED_SCOPES` gets `403` + `error="insufficient_scope"` |
+
+The stateless *protocol* changes in this revision (no `initialize` handshake,
+no `Mcp-Session-Id`, `MCP-Protocol-Version` / `Mcp-Method` / `Mcp-Name`
+headers) are the MCP server's business, not the proxy's — `/mcp-verify`
+already treats every request independently, so nothing there needs to change.
+
+### Client ID Metadata Documents
+
+A client publishes a JSON document at an `https` URL with a path
+(`https://app.example.com/oauth/client.json`) and passes that URL as its
+`client_id`. The AS resolves it on `GET /oauth2/authorize` and requires
+`client_id` (matching the URL exactly), `client_name`, and `redirect_uris`.
+The authorization request's `redirect_uri` must match one of them exactly, as
+with a registered client.
+
+Because the AS fetches an attacker-chosen URL, the fetch is fenced in:
+non-public destinations are refused after DNS resolution (SSRF), redirects are
+not followed, the body is capped at 32 KiB, the request is timed out, results
+(including failures) are cached, and the endpoint is rate limited per IP. Set
+`MCP_CIMD_ALLOWED_HOSTS` to narrow it further to hosts you trust.
+
+The consent page names the document's host under **Published by** — that
+domain is the only part of a CIMD client's identity the AS actually verified;
+`client_name` stays labelled unverified. Clients whose redirect URIs are all
+loopback get an extra warning, since no authorization server can tell them
+apart from anything else running on the user's machine.
 
 ### Flow
 
@@ -211,12 +249,13 @@ cookie flow completely untouched. When enabled, the proxy:
       │◄─────────────────────────────────│                                │
       │  GET /.well-known/oauth-protected-resource/<path>  (PRM, RFC 9728) │
       │  GET /.well-known/oauth-authorization-server       (AS md, 8414)   │
-      │  POST /oauth2/register            │  (DCR, RFC 7591 → client_id)   │
-      │─────────────────────────────────►│                                │
+      │  client_id = https URL of its own metadata document (CIMD)         │
+      │      (or POST /oauth2/register — deprecated DCR, RFC 7591)         │
       │  GET /oauth2/authorize (browser, PKCE S256 + resource)             │
-      │─────────────────────────────────►│  no Entra cookie? ───► SSO ────►│
+      │─────────────────────────────────►│  fetch + validate the CIMD doc │
+      │                                   │  no Entra cookie? ──► SSO ────►│
       │                                   │  consent page (Approve)        │
-      │  POST /oauth2/authorize (same-origin, CSRF-guarded) → code         │
+      │  POST /oauth2/authorize (same-origin, CSRF-guarded) → code + iss   │
       │  POST /oauth2/token (code + PKCE verifier) → access + refresh      │
       │◄─────────────────────────────────│                                │
       │  GET /mcp  Authorization: Bearer <access token>                    │
@@ -233,11 +272,11 @@ redirects — only `200` / `401` / `403`.
 
 | Path | Method | Purpose |
 | --- | --- | --- |
-| `/.well-known/oauth-authorization-server` | GET | AS metadata (RFC 8414) |
-| `/.well-known/openid-configuration` | GET | Same, plus OIDC-probe fields |
+| `/.well-known/oauth-authorization-server[/<issuer path>]` | GET | AS metadata (RFC 8414) |
+| `/.well-known/openid-configuration[/<issuer path>]` | GET | Same, plus OIDC-probe fields |
 | `/.well-known/oauth-protected-resource[/<path>]` | GET | Protected-resource metadata (RFC 9728) |
 | `/oauth2/jwks.json` | GET | Public ES256 signing key(s) |
-| `/oauth2/register` | POST | Dynamic Client Registration (RFC 7591) |
+| `/oauth2/register` | POST | Dynamic Client Registration (RFC 7591) — deprecated |
 | `/oauth2/authorize` | GET | Validate + authenticate + render consent |
 | `/oauth2/authorize` | POST | Same-origin, CSRF-guarded — mints the code |
 | `/oauth2/token` | POST | authorization_code + refresh_token grants |
@@ -258,10 +297,23 @@ redirects — only `200` / `401` / `403`.
 | `MCP_REFRESH_TOKEN_TTL` | no | `8h` | Refresh lifetime — short on purpose (see below) |
 | `MCP_CODE_TTL` | no | `60s` | Authorization-code lifetime |
 | `MCP_AUTHREQ_TTL` | no | `5m` | Consent-request blob lifetime |
-| `MCP_SCOPES_SUPPORTED` | no | `mcp` | Advertised scopes (drives metadata + PRM) |
+| `MCP_SCOPES_SUPPORTED` | no | `mcp` | Advertised scopes (drives metadata + PRM). A request for anything outside this set is `invalid_scope`; a request with no `scope` grants all of them |
+| `MCP_REQUIRED_SCOPES` | no | — | Scopes `/mcp-verify` demands. Must be a subset of the above. Empty = no scope enforcement |
+| `MCP_CIMD_ENABLED` | no | `true` | Accept Client ID Metadata Document `client_id`s |
+| `MCP_CIMD_ALLOWED_HOSTS` | no | — | Trust policy for CIMD hosts: exact hosts or `*.example.com`. Empty = any public host |
+| `MCP_CIMD_ALLOW_PRIVATE_HOSTS` | no | `false` | Drop the SSRF guard so CIMD documents may be fetched from private/loopback addresses. Testing only |
+| `MCP_CIMD_CACHE_TTL` | no | `15m` | Fallback cache lifetime when the document sends no `Cache-Control` (header `max-age` wins, clamped to 1m–24h) |
+| `MCP_CIMD_CACHE_SIZE` | no | `512` | Max cached client metadata documents |
+| `MCP_CIMD_TIMEOUT` | no | `5s` | Timeout for a client metadata fetch |
 
 `ALLOWED_EMAILS` / `ALLOWED_DOMAINS` gate MCP access too — enforced at both
 `/oauth2/authorize` and `/mcp-verify`.
+
+> **Setting `MCP_REQUIRED_SCOPES` invalidates tokens in flight.** Access tokens
+> issued before it was set carry whatever scope was requested then, so any that
+> fall short start getting `403 insufficient_scope` until they expire
+> (`MCP_ACCESS_TOKEN_TTL`, 15m by default). Clients recover on their own by
+> re-authorizing with the challenged scope.
 
 Generate a signing key with:
 
